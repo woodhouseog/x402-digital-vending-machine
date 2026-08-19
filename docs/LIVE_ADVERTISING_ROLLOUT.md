@@ -104,3 +104,9 @@ This rollout log captures only executed/observed status lines and manual require
 - Confirmed PR #12497 MCP snippet now embeds `PAYLOAD` request target as `https://x402digitalvendingmachine.store/v1/clean`.
 - Public repository: https://github.com/woodhouseog/x402-digital-vending-machine (pushed)
 - Freeze-state: README + PR body edit completed and logged.
+
+## Awesome Eliza Registry Submission (2026-08-19)
+- PR opened: https://github.com/thejoven/awesome-eliza/pull/31
+- Branch: feature/add-x402-cleanup-plugin
+- Repository indexed: https://github.com/woodhouseog/x402-digital-vending-machine
+- Registry note: Added plugin entry to Awesome Eliza Tools & Utilities for direct AI-agent discovery.
