@@ -20,8 +20,9 @@ import json
 import time
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
+import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import requests
 from base58 import b58decode
@@ -496,12 +497,16 @@ def main() -> None:
     text = args.text_to_clean or args.text
 
     client = X402ClientSDK(endpoint=args.endpoint, rpc_url=args.rpc_url, timeout_seconds=args.timeout)
-    result = client.clean_text(
-        text=text,
-        keypair_path=args.keypair,
-        verify_signature=not args.no_wait,
-        keypair_timeout_seconds=int(args.timeout),
-    )
+    try:
+        result = client.clean_text(
+            text=text,
+            keypair_path=args.keypair,
+            verify_signature=not args.no_wait,
+            keypair_timeout_seconds=int(args.timeout),
+        )
+    except SDKError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
     print(json.dumps(result, indent=2, sort_keys=True))
 
