@@ -182,6 +182,27 @@ For raw API testing, both paid routes share the same middleware and endpoint mar
 
 Use payload `{"text_to_clean": "..."}` and include `PAYMENT-SIGNATURE` (or `PAYMENT` / `X-PAYMENT`) on the second request when testing with custom tooling.
 
+### Python SDK Wrapper (`scripts/x402_client_sdk.py`)
+
+For one-command developer adoption, use the new reusable wrapper in `scripts/x402_client_sdk.py`:
+
+```bash
+python3 /Users/woodhouse/Desktop/"CRYPTO TOOL USDC"/scripts/x402_client_sdk.py \
+  --text "Messy   unstructured   text   payload" \
+  --endpoint https://x402digitalvendingmachine.store/v1/clean \
+  --keypair /absolute/path/to/solana/keypair.json
+```
+
+The SDK performs:
+
+1. `POST` probe to the service.
+2. Automatic challenge handling on `402`.
+3. On-chain 0.002 USDC payment flow with provided keypair (Solana mainnet).
+4. Signed proof re-submission with `PAYMENT-SIGNATURE`.
+5. Returns the final cleaned JSON response on `200 OK`.
+
+You can also bypass wait confirmation for immediate local retries with `--no-wait`.
+
 ## Runtime routes
 
 - `/`
