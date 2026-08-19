@@ -63,3 +63,27 @@ server_stdout.log
 /tmp/
 tmp/
 *.tmp
+
+# Added to protect operator runtime/session artifacts
+*.tar.gz
+logs/
+.cloudflared*
+.launcher*
+payment_registry.db.backup_*
+production-bundle-*.tar.gz
+CLOUDFLARE_PROXY_SHIELD.md
+CRYPTO
+DEPLOY_TO_VPS.md
+Dockerfile
+docker-compose.yml
+export-production-bundle.command
+launch-dashboard.command
+launch-live.command
+launch-production.command
+publish-checklist.command
+publish-live.command
+server-daemon-loop.command
+start-server-daemon.command
+stop-server-daemon.command
+test_server.py
+test_x402_protocol.py
