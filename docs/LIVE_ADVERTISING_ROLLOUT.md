@@ -93,3 +93,14 @@ This rollout log captures only executed/observed status lines and manual require
 - Branch: feat/add-x402-vending-node
 - Pull Request: https://github.com/punkpeye/awesome-mcp-servers/pull/12497
 - Status: opened
+
+## PR #12497 Link Correction (2026-08-19)
+- Replaced PR body reference from https://x402digitalvendingmachine.store to https://github.com/woodhouseog/x402-digital-vending-machine
+- Reason: unblock non-github-url gate in PR checks
+- PR edit command executed: gh pr edit 12497
+
+## Endpoint Alignment Fix Applied (2026-08-19)
+- Updated `/Users/woodhouse/Desktop/CRYPTO TOOL USDC/README.md` MCP/Solana plugin snippet to call `https://x402digitalvendingmachine.store/v1/clean`.
+- Confirmed PR #12497 MCP snippet now embeds `PAYLOAD` request target as `https://x402digitalvendingmachine.store/v1/clean`.
+- Public repository: https://github.com/woodhouseog/x402-digital-vending-machine (pushed)
+- Freeze-state: README + PR body edit completed and logged.

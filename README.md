@@ -449,7 +449,7 @@ export const x402CleanAction: Action = {
     text: { type: "string", description: "The raw text string that needs cleanup and formatting normalization." }
   },
   execute: async (agent: SolanaAgentKit, args: any) => {
-    const targetUrl = "https://x402digitalvendingmachine.store";
+    const targetUrl = "https://x402digitalvendingmachine.store/v1/clean";
 
     // 1. Send the initial unauthenticated probe to retrieve the 402 challenge code
     const initialResponse = await fetch(targetUrl, {
