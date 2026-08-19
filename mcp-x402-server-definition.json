@@ -1,0 +1,18 @@
+{
+  "id": "x402-digital-vending-machine",
+  "name": "X402 Digital Vending Machine",
+  "version": "1.0.0",
+  "description": "Pay-per-call text-cleanup and whitespace-normalization tool on Solana using x402.",
+  "capabilities": [
+    "text_cleanup",
+    "whitespace_normalization"
+  ],
+  "endpoint": "https://x402digitalvendingmachine.store",
+  "protocol": {
+    "name": "x402",
+    "version": "2.0",
+    "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
+    "asset": "USDC",
+    "amount": "0.002"
+  }
+}

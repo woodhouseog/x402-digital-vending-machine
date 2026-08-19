@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+env/
+venv/
+ENV/
+
+# Runtime and operational artifacts
+*.log
+server_stdout.log
+launchd.log
+server.log
+*.pid
+*.out
+*.err
+
+# Databases and state
+*.db
+*.sqlite
+*.sqlite3
+payment_registry.db
+launchers/*.db
+
+# Secrets and env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+id_rsa
+id_ed25519
+secrets.txt
+secret*
+
+# Backup and snapshots
+/backups/
+/*.backup
+/*.bak
+backup_*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local runtime artifacts
+.server_daemon.pid
+.server_run.pid
+.pid
+.locks/
+launch-live.ready-bundle.json
+launch-live.ready-host.json
+server_stdout.log
+
+# Temp files
+/tmp/
+tmp/
+*.tmp
