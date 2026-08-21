@@ -1,19 +1,34 @@
 {
   "x402Version": 2,
   "resource": {
-    "url": "https://www.x402digitalvendingmachine.store/v1/clean",
+    "url": "https://www.x402digitalvendingmachine.store/v1/schema-gate",
     "method": "POST",
-    "description": "Collapse repeated whitespace and return normalized text as structured JSON.",
+    "description": "Return a signed ACCEPT or REJECT verdict for JSON against a target schema and committed acceptance policy.",
     "mimeType": "application/json",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "text": {
+        "order_id": { "type": "string", "minLength": 1 },
+        "idempotency_key": { "type": "string", "minLength": 1 },
+        "input": true,
+        "target_schema": { "type": "object" },
+        "acceptance_criteria": {
+          "oneOf": [{ "type": "object" }, { "type": "array" }]
+        },
+        "acceptance_commitment": {
           "type": "string",
-          "minLength": 1
-        }
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "expires_at": { "type": "string" }
       },
-      "required": ["text"],
+      "required": [
+        "order_id",
+        "idempotency_key",
+        "input",
+        "target_schema",
+        "acceptance_criteria",
+        "acceptance_commitment"
+      ],
       "additionalProperties": false
     }
   },
@@ -21,10 +36,20 @@
     {
       "scheme": "exact",
       "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-      "amount": "2000",
+      "amount": "10000",
       "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
       "maxTimeoutSeconds": 120
     }
-  ]
+  ],
+  "extensions": {
+    "billing": {
+      "displayAmount": "0.010 USDC",
+      "unit": "completed signed evaluation",
+      "paidVerdicts": ["ACCEPT", "REJECT"],
+      "unsettledFailures": ["malformed preflight", "payment", "provider"],
+      "idempotentRecovery": "no additional charge"
+    },
+    "legacyResource": "https://www.x402digitalvendingmachine.store/v1/clean"
+  }
 }

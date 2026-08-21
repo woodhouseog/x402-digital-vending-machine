@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -27,11 +28,15 @@ from x402.mechanisms.svm.exact.register import register_exact_svm_client
 
 
 SERVICE_ENDPOINT = "https://www.x402digitalvendingmachine.store/v1/clean"
+SCHEMA_GATE_ENDPOINT = (
+    "https://www.x402digitalvendingmachine.store/v1/schema-gate"
+)
 MAINNET_RPC = "https://api.mainnet-beta.solana.com"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RECIPIENT_WALLET = "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD"
 PAYMENT_AMOUNT_ATOMIC = 2_000
+SCHEMA_GATE_AMOUNT_ATOMIC = 10_000
 USDC_DECIMALS = 6
 PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED"
 PAYMENT_SIGNATURE_HEADER = "PAYMENT-SIGNATURE"
@@ -56,10 +61,36 @@ class ChallengeMetadata:
     fee_payer: str
     memo: str
     challenge_id: str
+    amount_atomic: int
+
+
+def canonicalize_acceptance_criteria(acceptance_criteria: Any) -> str:
+    """Return the deterministic JSON representation committed to the request."""
+    if not isinstance(acceptance_criteria, (dict, list)):
+        raise SDKError("acceptance_criteria must be a JSON object or array.")
+    if not acceptance_criteria:
+        raise SDKError("acceptance_criteria cannot be empty.")
+    try:
+        return json.dumps(
+            acceptance_criteria,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SDKError("acceptance_criteria must contain valid JSON values.") from exc
+
+
+def build_acceptance_commitment(acceptance_criteria: Any) -> str:
+    """Build the SHA-256 commitment sent with every Schema Gate request."""
+    canonical = canonicalize_acceptance_criteria(acceptance_criteria)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 class X402ClientSDK:
-    """One-call client for the pinned production cleanup endpoint."""
+    """Client for the pinned Schema Gate and legacy cleanup endpoints."""
 
     def __init__(
         self,
@@ -195,9 +226,200 @@ class X402ClientSDK:
         result.setdefault("payment_response", settlement)
         return result
 
+    def schema_gate(
+        self,
+        *,
+        order_id: str,
+        idempotency_key: str,
+        input: Any,
+        target_schema: Mapping[str, Any],
+        acceptance_criteria: Any,
+        wallet_key: Optional[Any] = None,
+        keypair_path: Optional[str] = None,
+        expires_at: Optional[str] = None,
+        max_amount_atomic: int = SCHEMA_GATE_AMOUNT_ATOMIC,
+    ) -> dict[str, Any]:
+        """Purchase one signed Schema Gate evaluation or recover its receipt.
+
+        The initial request is always unsigned. Wallet material is loaded only
+        after the service returns a valid HTTP 402 challenge. An exact retry of
+        an already completed idempotency key can therefore return its recovery
+        response without creating another payment.
+        """
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise SDKError("order_id must be a non-empty string.")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise SDKError("idempotency_key must be a non-empty string.")
+        if not isinstance(target_schema, Mapping) or not target_schema:
+            raise SDKError("target_schema must be a non-empty JSON object.")
+        if keypair_path and wallet_key is not None:
+            raise SDKError("Provide either wallet_key or keypair_path, not both.")
+        if (
+            isinstance(max_amount_atomic, bool)
+            or not isinstance(max_amount_atomic, int)
+            or max_amount_atomic <= 0
+        ):
+            raise SDKError("max_amount_atomic must be a positive integer.")
+        if expires_at is not None and (
+            not isinstance(expires_at, str) or not expires_at.strip()
+        ):
+            raise SDKError("expires_at must be a non-empty timestamp string.")
+
+        commitment = build_acceptance_commitment(acceptance_criteria)
+        body: dict[str, Any] = {
+            "order_id": order_id.strip(),
+            "idempotency_key": idempotency_key.strip(),
+            "input": input,
+            "target_schema": dict(target_schema),
+            "acceptance_criteria": acceptance_criteria,
+            "acceptance_commitment": commitment,
+        }
+        if expires_at is not None:
+            body["expires_at"] = expires_at.strip()
+        try:
+            json.dumps(body, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise SDKError("Schema Gate request must contain valid JSON values.") from exc
+
+        probe = self._post_json(SCHEMA_GATE_ENDPOINT, body)
+        if probe.status_code == 200:
+            return self._parse_schema_gate_result(
+                probe,
+                order_id=body["order_id"],
+                idempotency_key=body["idempotency_key"],
+                acceptance_commitment=commitment,
+            )
+        if probe.status_code != 402:
+            self._raise_http_error(
+                probe, "Schema Gate preflight did not return a payment challenge"
+            )
+
+        encoded_required = probe.headers.get(PAYMENT_REQUIRED_HEADER)
+        if not encoded_required:
+            raise ProtocolError(
+                f"HTTP 402 response omitted {PAYMENT_REQUIRED_HEADER}."
+            )
+        payment_required = self._decode_base64_json(
+            encoded_required, PAYMENT_REQUIRED_HEADER
+        )
+        metadata = self._validate_payment_required(
+            payment_required,
+            expected_endpoint=SCHEMA_GATE_ENDPOINT,
+            expected_amount=None,
+            max_amount=max_amount_atomic,
+        )
+
+        if not keypair_path and wallet_key is None:
+            raise SDKError(
+                "A new Schema Gate evaluation requires wallet_key or "
+                "a local Solana keypair_path."
+            )
+        payer = (
+            self._coerce_keypair(wallet_key)
+            if wallet_key is not None
+            else self._load_keypair(keypair_path or "")
+        )
+        if str(payer.pubkey()) == metadata.fee_payer:
+            raise ProtocolError(
+                "Buyer authority cannot also be the facilitator fee payer."
+            )
+
+        core_client = x402ClientSync()
+        register_exact_svm_client(
+            core_client,
+            KeypairSigner(payer),
+            networks=SOLANA_NETWORK,
+            rpc_url=self.rpc_url,
+        )
+        http_client = x402HTTPClientSync(core_client)
+        response_headers = dict(probe.headers)
+        response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
+        try:
+            payment_headers, payment_payload = http_client.handle_402_response(
+                response_headers,
+                probe.content,
+                probe.url,
+            )
+        except Exception as exc:
+            raise PaymentError(
+                f"Could not create canonical exact-SVM payment payload: {exc}"
+            ) from exc
+        if payment_payload is None:
+            raise ProtocolError("x402 client did not create a payment payload.")
+        self._validate_payment_payload(
+            payment_headers,
+            metadata,
+            expected_endpoint=SCHEMA_GATE_ENDPOINT,
+        )
+
+        # A monetary request is sent exactly once. Ambiguous transport failures
+        # are recovered by repeating the unsigned idempotent call, not by
+        # automatically creating another payment.
+        paid_response = self._post_json(
+            SCHEMA_GATE_ENDPOINT, body, extra_headers=payment_headers
+        )
+        try:
+            processed = http_client.process_payment_result(
+                payment_payload,
+                lambda name: paid_response.headers.get(name),
+                paid_response.status_code,
+            )
+        except Exception as exc:
+            raise ProtocolError(
+                f"Invalid PAYMENT-RESPONSE settlement header: {exc}"
+            ) from exc
+
+        settle_response = processed.settle_response
+        if paid_response.status_code != 200:
+            if settle_response is not None:
+                settlement_error = settle_response.model_dump(
+                    mode="json", by_alias=True
+                )
+                raise PaymentError(
+                    "Facilitator rejected settlement: "
+                    f"{settlement_error.get('errorReason') or settlement_error}"
+                )
+            self._raise_http_error(
+                paid_response, "Schema Gate settlement or evaluation failed"
+            )
+        if settle_response is None:
+            raise ProtocolError("Paid response omitted PAYMENT-RESPONSE.")
+        settlement = settle_response.model_dump(mode="json", by_alias=True)
+        if settlement.get("success") is not True:
+            reason = settlement.get("errorReason") or settlement.get("error")
+            raise PaymentError(
+                f"Facilitator did not confirm settlement: {reason or settlement}"
+            )
+
+        result = self._parse_schema_gate_result(
+            paid_response,
+            order_id=body["order_id"],
+            idempotency_key=body["idempotency_key"],
+            acceptance_commitment=commitment,
+        )
+        result.setdefault("payment_response", settlement)
+        result.setdefault("amount_atomic", metadata.amount_atomic)
+        return result
+
+    def gate_json(self, **kwargs: Any) -> dict[str, Any]:
+        """Alias for :meth:`schema_gate`."""
+        return self.schema_gate(**kwargs)
+
     def _post_clean(
         self,
         text: str,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> Response:
+        return self._post_json(
+            self.endpoint,
+            {"text": text},
+            extra_headers=extra_headers,
+        )
+
+    def _post_json(
+        self,
+        endpoint: str,
+        body: Mapping[str, Any],
         extra_headers: Mapping[str, str] | None = None,
     ) -> Response:
         headers = {
@@ -209,24 +431,30 @@ class X402ClientSDK:
             headers.update(dict(extra_headers))
         try:
             return self.session.post(
-                self.endpoint,
-                json={"text": text},
+                endpoint,
+                json=dict(body),
                 headers=headers,
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
-            raise SDKError(f"Request to {self.endpoint} failed: {exc}") from exc
+            raise SDKError(f"Request to {endpoint} failed: {exc}") from exc
 
     def _validate_payment_required(
-        self, payment_required: dict[str, Any]
+        self,
+        payment_required: dict[str, Any],
+        *,
+        expected_endpoint: str | None = None,
+        expected_amount: int | None = PAYMENT_AMOUNT_ATOMIC,
+        max_amount: int | None = None,
     ) -> ChallengeMetadata:
         if payment_required.get("x402Version") != 2:
             raise ProtocolError("Payment challenge must use x402Version 2.")
 
+        pinned_endpoint = expected_endpoint or self.endpoint
         resource = payment_required.get("resource")
-        if not isinstance(resource, dict) or resource.get("url") != self.endpoint:
+        if not isinstance(resource, dict) or resource.get("url") != pinned_endpoint:
             raise ProtocolError(
-                f"Payment resource must be exactly {self.endpoint}."
+                f"Payment resource must be exactly {pinned_endpoint}."
             )
 
         accepts = payment_required.get("accepts")
@@ -250,9 +478,20 @@ class X402ClientSDK:
                 "and the pinned recipient."
             )
         amount = accepted.get("amount")
-        if isinstance(amount, bool) or str(amount) != str(PAYMENT_AMOUNT_ATOMIC):
+        try:
+            amount_atomic = int(str(amount))
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("Payment amount must be an integer string.") from exc
+        if isinstance(amount, bool) or amount_atomic <= 0:
+            raise ProtocolError("Payment amount must be positive.")
+        if expected_amount is not None and amount_atomic != expected_amount:
             raise ProtocolError(
-                f"Payment amount must be {PAYMENT_AMOUNT_ATOMIC} atomic USDC."
+                f"Payment amount must be {expected_amount} atomic USDC."
+            )
+        if max_amount is not None and amount_atomic > max_amount:
+            raise ProtocolError(
+                f"Payment amount {amount_atomic} exceeds the authorized cap "
+                f"of {max_amount} atomic USDC."
             )
 
         extra = accepted.get("extra")
@@ -282,12 +521,15 @@ class X402ClientSDK:
             fee_payer=fee_payer.strip(),
             memo=memo,
             challenge_id=challenge_id.strip(),
+            amount_atomic=amount_atomic,
         )
 
     def _validate_payment_payload(
         self,
         headers: Mapping[str, str],
         metadata: ChallengeMetadata,
+        *,
+        expected_endpoint: str | None = None,
     ) -> None:
         encoded = self._mapping_header(headers, PAYMENT_SIGNATURE_HEADER)
         if not encoded:
@@ -296,8 +538,9 @@ class X402ClientSDK:
         if envelope.get("x402Version") != 2:
             raise ProtocolError("Generated payment payload is not x402 v2.")
 
+        pinned_endpoint = expected_endpoint or self.endpoint
         resource = envelope.get("resource")
-        if not isinstance(resource, dict) or resource.get("url") != self.endpoint:
+        if not isinstance(resource, dict) or resource.get("url") != pinned_endpoint:
             raise ProtocolError("Generated payment payload changed the resource.")
         generated_terms = envelope.get("accepted")
         if not isinstance(generated_terms, dict):
@@ -331,6 +574,55 @@ class X402ClientSDK:
             raise ProtocolError(
                 "Generated SVM transaction is not valid base64."
             ) from exc
+
+    def _parse_schema_gate_result(
+        self,
+        response: Response,
+        *,
+        order_id: str,
+        idempotency_key: str,
+        acceptance_commitment: str,
+    ) -> dict[str, Any]:
+        result = self._parse_json_object(response, "Schema Gate response")
+        returned_order = result.get("order_id")
+        if returned_order is not None and returned_order != order_id:
+            raise ProtocolError("Schema Gate response changed order_id.")
+        returned_key = result.get("idempotency_key")
+        if returned_key is not None and returned_key != idempotency_key:
+            raise ProtocolError("Schema Gate response changed idempotency_key.")
+        returned_commitment = result.get("acceptance_commitment")
+        if (
+            returned_commitment is not None
+            and returned_commitment != acceptance_commitment
+        ):
+            raise ProtocolError(
+                "Schema Gate response changed acceptance_commitment."
+            )
+
+        verdict = result.get("verdict")
+        if verdict not in {"ACCEPT", "REJECT"}:
+            raise ProtocolError("Schema Gate verdict must be ACCEPT or REJECT.")
+        if verdict == "ACCEPT" and "output" not in result:
+            raise ProtocolError("An ACCEPT verdict must include output.")
+        if verdict == "REJECT" and result.get("output") is not None:
+            raise ProtocolError("A REJECT verdict cannot include output.")
+
+        checks = result.get("checks")
+        if checks is not None and not isinstance(checks, (dict, list)):
+            raise ProtocolError("Schema Gate checks must be an object or array.")
+        receipt = result.get("receipt")
+        if receipt is not None and not isinstance(receipt, (dict, str)):
+            raise ProtocolError("Schema Gate receipt must be an object or string.")
+        recovery = result.get("recovery")
+        if isinstance(recovery, bool):
+            result["recovery"] = {"recovered": recovery}
+        elif recovery is not None and not isinstance(recovery, dict):
+            raise ProtocolError("Schema Gate recovery must be an object or boolean.")
+
+        result.setdefault("order_id", order_id)
+        result.setdefault("idempotency_key", idempotency_key)
+        result.setdefault("acceptance_commitment", acceptance_commitment)
+        return result
 
     @staticmethod
     def _mapping_header(

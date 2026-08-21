@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "x402 Digital Vending Machine",
-    "version": "2.0.0",
-    "description": "Pay-per-call whitespace normalization protected by canonical x402 v2 exact Solana USDC payment."
+    "version": "3.0.0",
+    "description": "Signed JSON Schema Gate verdicts plus legacy text normalization, protected by canonical x402 v2 exact Solana USDC payment."
   },
   "servers": [
     {
@@ -11,6 +11,68 @@
     }
   ],
   "paths": {
+    "/v1/schema-gate": {
+      "post": {
+        "operationId": "schemaGate",
+        "summary": "Evaluate JSON and return a signed ACCEPT or REJECT verdict",
+        "parameters": [
+          {
+            "name": "PAYMENT-SIGNATURE",
+            "in": "header",
+            "required": false,
+            "description": "Base64-encoded canonical x402 v2 PaymentPayload.",
+            "schema": { "type": "string", "contentEncoding": "base64" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SchemaGateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completed paid ACCEPT/REJECT verdict, or exact idempotent recovery without a second charge.",
+            "headers": {
+              "PAYMENT-RESPONSE": {
+                "description": "Present for a newly settled evaluation; base64 x402 v2 SettlementResponse.",
+                "schema": { "type": "string", "contentEncoding": "base64" }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SchemaGateResponse" }
+              }
+            }
+          },
+          "400": { "description": "Malformed preflight; no settlement." },
+          "402": {
+            "description": "Payment required or supplied payment rejected.",
+            "headers": {
+              "PAYMENT-REQUIRED": {
+                "required": true,
+                "description": "Base64-encoded x402 v2 PaymentRequired object.",
+                "schema": { "type": "string", "contentEncoding": "base64" }
+              }
+            }
+          },
+          "409": { "description": "Idempotency key reused with different request material; no new settlement." },
+          "422": { "description": "Request cannot be evaluated; no settlement." },
+          "503": { "description": "Provider unavailable; no settlement." }
+        },
+        "x-x402": {
+          "x402Version": 2,
+          "scheme": "exact",
+          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "amount": "10000",
+          "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
+          "billing": "one charge per completed ACCEPT or REJECT; exact recovery is free"
+        }
+      }
+    },
     "/v1/clean": {
       "post": {
         "operationId": "cleanText",
@@ -104,6 +166,50 @@
   },
   "components": {
     "schemas": {
+      "SchemaGateRequest": {
+        "type": "object",
+        "properties": {
+          "order_id": { "type": "string", "minLength": 1 },
+          "idempotency_key": { "type": "string", "minLength": 1 },
+          "input": true,
+          "target_schema": { "type": "object" },
+          "acceptance_criteria": {
+            "oneOf": [{ "type": "object" }, { "type": "array" }]
+          },
+          "acceptance_commitment": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "expires_at": { "type": "string" }
+        },
+        "required": [
+          "order_id",
+          "idempotency_key",
+          "input",
+          "target_schema",
+          "acceptance_criteria",
+          "acceptance_commitment"
+        ],
+        "additionalProperties": false
+      },
+      "SchemaGateResponse": {
+        "type": "object",
+        "required": ["verdict"],
+        "properties": {
+          "verdict": { "enum": ["ACCEPT", "REJECT"] },
+          "output": { "description": "Present only when verdict is ACCEPT." },
+          "checks": {
+            "oneOf": [{ "type": "object" }, { "type": "array" }]
+          },
+          "receipt": {
+            "oneOf": [{ "type": "object" }, { "type": "string" }]
+          },
+          "recovery": {
+            "oneOf": [{ "type": "object" }, { "type": "boolean" }]
+          }
+        },
+        "additionalProperties": true
+      },
       "CleanResponse": {
         "type": "object",
         "required": ["cleaned_text", "endpoint", "payment"],

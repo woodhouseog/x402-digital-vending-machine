@@ -1,4 +1,72 @@
-# x402 Digital Vending Machine
+# x402 Digital Vending Machine: Schema Gate
+
+Schema Gate gives an automated buyer a signed, deterministic verdict on whether
+JSON satisfies a declared schema and acceptance policy. A completed `ACCEPT` or
+`REJECT` evaluation costs `0.010 USDC` (`10000` atomic units). Malformed
+preflight requests, payment failures, and provider failures do not settle. An
+exact retry with the same `idempotency_key` recovers the original receipt and
+does not create a second charge. Every new task is a new paid use; installing
+or integrating the SDK is free.
+
+- Storefront: <https://www.x402digitalvendingmachine.store/>
+- Schema Gate: `POST https://www.x402digitalvendingmachine.store/v1/schema-gate`
+- Network: Solana mainnet
+- Protocol: x402 v2, `exact` scheme
+
+## Python integration
+
+Install directly from the public source repository (no PyPI publication is
+claimed):
+
+```bash
+python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-machine.git"
+```
+
+```python
+from x402_cleanup import schema_gate
+
+result = schema_gate(
+    order_id="order-1042",
+    idempotency_key="order-1042-v1",
+    input={"sku": "A-7", "quantity": 2},
+    target_schema={
+        "type": "object",
+        "required": ["sku", "quantity"],
+        "properties": {
+            "sku": {"type": "string"},
+            "quantity": {"type": "integer", "minimum": 1},
+        },
+    },
+    acceptance_criteria={"quantity_limit": 10},
+    wallet_key=agent_key,
+)
+
+print(result["verdict"])
+if result["verdict"] == "ACCEPT":
+    print(result["output"])
+print(result.get("receipt"), result.get("checks"))
+```
+
+The client canonicalizes `acceptance_criteria` with sorted compact JSON and
+sends `acceptance_commitment = sha256:<hex>`. It probes without wallet use,
+validates the returned resource, Solana network, USDC mint, recipient, and
+dynamic price, then signs through the standard x402 v2 exact-SVM library only
+after a valid HTTP `402`. `max_amount_atomic` defaults to the published `10000`
+atomic-unit ceiling.
+
+## Schema Gate request contract
+
+Required JSON keys are `order_id`, `idempotency_key`, `input`, `target_schema`,
+`acceptance_criteria`, and `acceptance_commitment`. `expires_at` is optional.
+Use a new idempotency key for each new evaluation. Reuse a key only to recover
+the exact same request.
+
+The response uses `verdict`, optional structured `checks`, and a signed
+`receipt`. `output` is present only for `ACCEPT`. `recovery` identifies an
+idempotent replay when supplied. Both `ACCEPT` and `REJECT` are completed paid
+verdicts; malformed/provider failures are not verdicts and remain unsettled.
+
+## Legacy text cleanup
 
 Clean noisy text before it reaches an agent's context window. The service
 collapses repeated whitespace and returns compact structured JSON for a flat
@@ -10,7 +78,7 @@ collapses repeated whitespace and returns compact structured JSON for a flat
 - Network: Solana mainnet
 - Protocol: x402 v2, `exact` scheme
 
-## One-line Python integration
+### Legacy Python integration
 
 Install the client directly from this repository:
 
@@ -32,7 +100,7 @@ The wrapper requests the 402 challenge, validates the exact terms, signs the
 canonical Solana payment payload with the buyer wallet, resubmits the request,
 and returns the service result with its settlement receipt.
 
-## Buyer contract
+### Legacy buyer contract
 
 | Field | Required value |
 | --- | --- |
@@ -75,6 +143,9 @@ No normalized output is returned until payment is accepted and settled.
 - Agent summary: <https://www.x402digitalvendingmachine.store/llms.txt>
 - MCP descriptor: [`mcp-x402-server-definition.json`](mcp-x402-server-definition.json)
 - Client guide: [`docs_CLIENT_GUIDE.md`](docs_CLIENT_GUIDE.md)
+
+`mcp-x402-server-definition.json` is a portable descriptor only. This project
+does not claim that an MCP directory has registered or endorsed the service.
 
 ## Wallet safety
 

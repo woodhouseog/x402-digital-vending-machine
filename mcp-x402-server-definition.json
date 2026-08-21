@@ -2,10 +2,55 @@
   "schemaVersion": "1.0",
   "id": "x402-digital-vending-machine",
   "name": "x402 Digital Vending Machine",
-  "version": "2.0.0",
-  "description": "Pay-per-call text normalization for AI agents using canonical x402 v2 exact Solana USDC payments.",
+  "version": "3.0.0",
+  "description": "Portable descriptor for signed JSON Schema Gate evaluations over x402 v2 exact Solana USDC payments. Descriptor publication does not imply registry acceptance.",
   "homepage": "https://www.x402digitalvendingmachine.store/",
   "tools": [
+    {
+      "name": "schema_gate",
+      "description": "Return a signed ACCEPT or REJECT verdict for JSON against a schema and committed acceptance policy.",
+      "transport": "https",
+      "method": "POST",
+      "endpoint": "https://www.x402digitalvendingmachine.store/v1/schema-gate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "order_id": { "type": "string", "minLength": 1 },
+          "idempotency_key": { "type": "string", "minLength": 1 },
+          "input": true,
+          "target_schema": { "type": "object" },
+          "acceptance_criteria": {
+            "oneOf": [{ "type": "object" }, { "type": "array" }]
+          },
+          "acceptance_commitment": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "expires_at": { "type": "string" }
+        },
+        "required": [
+          "order_id",
+          "idempotency_key",
+          "input",
+          "target_schema",
+          "acceptance_criteria",
+          "acceptance_commitment"
+        ],
+        "additionalProperties": false
+      },
+      "billing": {
+        "amount": "10000",
+        "displayAmount": "0.010 USDC",
+        "unit": "completed signed evaluation",
+        "paidVerdicts": ["ACCEPT", "REJECT"],
+        "freeOutcomes": [
+          "malformed preflight",
+          "payment failure",
+          "provider failure",
+          "exact idempotent recovery"
+        ]
+      }
+    },
     {
       "name": "clean_text",
       "description": "Collapse repeated whitespace and return normalized text as structured JSON.",
@@ -30,8 +75,8 @@
     "version": 2,
     "scheme": "exact",
     "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-    "amount": "2000",
-    "displayAmount": "0.002 USDC",
+    "amount": "10000",
+    "displayAmount": "0.010 USDC",
     "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
     "headers": {
@@ -44,5 +89,6 @@
   "discovery": {
     "x402": "https://www.x402digitalvendingmachine.store/.well-known/x402.json",
     "openapi": "https://www.x402digitalvendingmachine.store/openapi.json"
-  }
+  },
+  "registrationStatus": "descriptor-only"
 }

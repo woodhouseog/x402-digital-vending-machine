@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "x402-cleanup-client"
-version = "1.0.0"
-description = "One-line Solana USDC x402 client for paid text normalization"
+version = "1.1.0"
+description = "x402 client for paid Schema Gate evaluations and legacy text cleanup"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

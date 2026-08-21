@@ -1,4 +1,53 @@
-# Python client guide
+# Schema Gate Python client guide
+
+The `x402_cleanup` package exposes `schema_gate(...)` and its alias
+`gate_json(...)` for one signed JSON evaluation. Install from GitHub:
+
+```bash
+python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-machine.git"
+```
+
+```python
+from x402_cleanup import gate_json
+
+decision = gate_json(
+    order_id="order-1042",
+    idempotency_key="order-1042-v1",
+    input={"sku": "A-7", "quantity": 2},
+    target_schema={
+        "type": "object",
+        "required": ["sku", "quantity"],
+        "properties": {
+            "sku": {"type": "string"},
+            "quantity": {"type": "integer", "minimum": 1},
+        },
+    },
+    acceptance_criteria={"quantity_limit": 10},
+    keypair_path="~/.config/solana/id.json",
+)
+```
+
+The SDK computes a deterministic `sha256:<hex>` commitment over canonical
+acceptance criteria. It sends the unsigned request first, validates the pinned
+Schema Gate resource, Solana mainnet, official USDC mint, recipient, and
+challenged price, and only then asks the x402 library to sign. The default
+authorization ceiling is `10000` atomic USDC (`0.010 USDC`).
+
+Both `ACCEPT` and `REJECT` are completed signed evaluations and cost one use.
+Only `ACCEPT` includes `output`. Malformed preflight, payment, or provider
+failures are unsettled. An exact idempotent retry returns the saved receipt at
+no additional charge; each distinct task requires its own paid evaluation.
+
+Use `receipt`, `verdict`, `checks`, and `recovery` defensively. Do not expect
+`output` on a `REJECT`. The client never automatically resends a monetary
+request after an ambiguous transport failure; retry the same unsigned request
+with the same idempotency key to request recovery.
+
+Keep wallet secrets local. Integration is free, but every newly completed
+evaluation is billed. This repository does not claim a PyPI release or MCP
+registry publication.
+
+## Legacy cleanup client
 
 The `x402_cleanup` package provides a single-call Python interface for the
 production text-normalization service.
