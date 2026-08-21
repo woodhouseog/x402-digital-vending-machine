@@ -110,3 +110,47 @@ verify the signed receipt rather than trusting an order ID alone.
 
 Keep wallet secrets local. Never put a seed phrase or private key in source
 control, discovery documents, browser code, or request bodies.
+
+## Private-pilot Execution Gate
+
+Execution Gate is a private pilot for explicitly enabled integrations. It is
+not a universal execution layer and is not currently advertised in the public
+x402 manifest, OpenAPI document, `llms.txt`, or MCP descriptor. SDK symbols do
+not imply general availability or compatibility with arbitrary execution
+targets.
+
+```python
+from datetime import datetime, timedelta, timezone
+from x402_cleanup import execution_gate
+
+execution = execution_gate(
+    order_id="execution-1042",
+    idempotency_key="execution-1042-v1",
+    integration_id="canary",
+    integration_version="v1",
+    action_id="commit",
+    input={"sku": "A-7", "quantity": 2},
+    target_schema={"type": "object"},
+    acceptance_criteria=criteria,
+    expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    max_amount_atomic=17_500,  # Illustrative ceiling, not a quoted price.
+    keypair_path="~/.config/solana/id.json",
+)
+assert execution["execution_verified"] is True
+```
+
+`max_amount_atomic` is required and has no SDK default. It is the caller's hard
+payment ceiling, not a quote or promised price. The returned 402 supplies the
+price for that request, and the SDK rejects any amount above the caller's
+ceiling without raising it automatically. The SDK binds that selected amount,
+the integration policy, PREPARE and COMMIT evidence, effect acknowledgement,
+result, recovery terms, and settlement into a dedicated ES256 receipt verified
+against `/.well-known/execution-gate-receipt-jwks.json`.
+
+The paid request is attempted once. An ambiguous transport failure exposes the
+server-issued recovery token through `SDKError.recovery` and
+`client.last_recovery`; recovery uses only `GET /v1/executions/{order_id}` and
+cannot initiate another payment.
+
+The pilot does not guarantee support for every provider or action, execution
+success, customer adoption, demand, revenue, or continued availability.

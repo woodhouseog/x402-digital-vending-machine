@@ -39,8 +39,15 @@ SERVICE_ENDPOINT = "https://www.x402digitalvendingmachine.store/v1/clean"
 SCHEMA_GATE_ENDPOINT = (
     "https://www.x402digitalvendingmachine.store/v1/schema-gate"
 )
+EXECUTION_GATE_ENDPOINT = (
+    "https://www.x402digitalvendingmachine.store/v1/execution-gate"
+)
 RECEIPT_KEY_ENDPOINT = (
     "https://www.x402digitalvendingmachine.store/.well-known/receipt-key.json"
+)
+EXECUTION_RECEIPT_KEY_ENDPOINT = (
+    "https://www.x402digitalvendingmachine.store/"
+    ".well-known/execution-gate-receipt-jwks.json"
 )
 MAINNET_RPC = "https://api.mainnet-beta.solana.com"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
@@ -52,6 +59,8 @@ SCHEMA_GATE_NORMALIZER = "schema-gate-c14n-v1"
 SCHEMA_GATE_MAX_OUTPUT_BYTES = 100_000
 SCHEMA_GATE_RECEIPT_TYPE = "x402-schema-gate-receipt"
 SCHEMA_GATE_OPERATION = "schema-gate-v1"
+EXECUTION_GATE_RECEIPT_TYPE = "x402-execution-gate-receipt+jwt"
+EXECUTION_GATE_OPERATION = "execution-gate-v1"
 USDC_DECIMALS = 6
 PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED"
 PAYMENT_SIGNATURE_HEADER = "PAYMENT-SIGNATURE"
@@ -87,6 +96,7 @@ class ChallengeMetadata:
     challenge_id: str
     amount_atomic: int
     schema_gate: dict[str, Any] | None = None
+    execution_gate: dict[str, Any] | None = None
 
 
 def _canonical_json(value: Any) -> str:
@@ -266,6 +276,144 @@ def _schema_gate_binding(
     }
 
 
+def _execution_expires_epoch(
+    value: str | int | None,
+    *,
+    enforce_window: bool,
+) -> int:
+    if not isinstance(value, str) or not value.strip():
+        raise SDKError("Execution Gate expires_at must be an RFC 3339 string.")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise SDKError("Execution Gate expires_at must be valid RFC 3339.") from exc
+    if parsed.tzinfo is None:
+        raise SDKError("Execution Gate expires_at must include a timezone.")
+    epoch = int(parsed.timestamp())
+    if enforce_window:
+        now = int(datetime.now(timezone.utc).timestamp())
+        if epoch <= now + 30 or epoch > now + 600:
+            raise SDKError(
+                "Execution Gate expires_at must be 30 seconds to 10 minutes "
+                "in the future."
+            )
+    return epoch
+
+
+def _execution_identifier(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None
+    ):
+        raise SDKError(f"{field} must be 1-128 URL-safe characters.")
+    return value
+
+
+def _execution_recovery_token(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 256 or "." not in value:
+        raise SDKError("recovery_token must be a server-issued versioned token.")
+    version, signature = value.rsplit(".", 1)
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", version) is None
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", signature) is None
+    ):
+        raise SDKError("recovery_token must be a server-issued versioned token.")
+    return value
+
+
+def _execution_gate_binding(
+    *,
+    order_id: str,
+    idempotency_key: str,
+    integration_id: str,
+    integration_version: str,
+    action_id: str,
+    input: Any,
+    target_schema: Mapping[str, Any],
+    acceptance_criteria: Any,
+    expires_at: str | int | None,
+    audience: str,
+    environment: str,
+    configuration_hash: str,
+    policy_hash: str,
+    qualification_report_hash: str,
+    amount_atomic: int,
+    recovery_token: str | None,
+) -> dict[str, Any]:
+    """Build the exact buyer/request/price binding for Execution Gate."""
+    normalized_criteria = _normalize_acceptance_criteria(acceptance_criteria)
+    acceptance_commitment = build_acceptance_commitment(normalized_criteria)
+    input_hash = _sha256_text(_canonical_json(input))
+    schema_hash = _sha256_text(_canonical_json(dict(target_schema)))
+    idempotency_hash = _sha256_text(idempotency_key)
+    expires_epoch = _execution_expires_epoch(expires_at, enforce_window=False)
+    payload_hash = "sha256:" + _sha256_text(
+        _canonical_json(
+            {
+                "input": input,
+                "target_schema": dict(target_schema),
+                "acceptance_criteria": normalized_criteria,
+                "acceptance_commitment": acceptance_commitment,
+            }
+        )
+    )
+    request_hash = _sha256_text(
+        _canonical_json(
+            {
+                "operation": EXECUTION_GATE_OPERATION,
+                "order_id": order_id,
+                "idempotency_hash": idempotency_hash,
+                "integration_id": integration_id,
+                "integration_version": integration_version,
+                "action_id": action_id,
+                "audience": audience,
+                "configuration_hash": configuration_hash,
+                "policy_hash": policy_hash,
+                "input_hash": input_hash,
+                "schema_hash": schema_hash,
+                "acceptance_commitment": acceptance_commitment,
+                "network": SOLANA_NETWORK,
+                "asset": USDC_MINT,
+                "recipient": RECIPIENT_WALLET,
+                "amount_atomic": amount_atomic,
+                "expires_at": expires_epoch,
+            }
+        )
+    )
+    return {
+        "order_id": order_id,
+        "idempotency_hash": idempotency_hash,
+        "integration_id": integration_id,
+        "integration_version": integration_version,
+        "action_id": action_id,
+        "environment": environment,
+        "audience": audience,
+        "configuration_hash": configuration_hash,
+        "policy_hash": policy_hash,
+        "qualification_report_hash": qualification_report_hash,
+        "input_hash": input_hash,
+        "schema_hash": schema_hash,
+        "acceptance_commitment": acceptance_commitment,
+        "payload_hash": payload_hash,
+        "request_hash": request_hash,
+        "network": SOLANA_NETWORK,
+        "asset": USDC_MINT,
+        "recipient": RECIPIENT_WALLET,
+        "amount_atomic": amount_atomic,
+        "expires_at": expires_epoch,
+        "recovery_url": (
+            "https://www.x402digitalvendingmachine.store/v1/executions/"
+            f"{quote(order_id, safe='')}"
+        ),
+        "recovery_token_hash": (
+            _sha256_text(recovery_token) if recovery_token is not None else None
+        ),
+    }
+
+
 class X402ClientSDK:
     """Client for the pinned Schema Gate and legacy cleanup endpoints."""
 
@@ -287,6 +435,7 @@ class X402ClientSDK:
         self.session = session or requests.Session()
         self.last_recovery: dict[str, Any] | None = None
         self._receipt_key: dict[str, Any] | None = None
+        self._execution_receipt_keys: dict[str, dict[str, Any]] = {}
 
     def clean_text(
         self,
@@ -628,6 +777,405 @@ class X402ClientSDK:
         """Alias for :meth:`schema_gate`."""
         return self.schema_gate(**kwargs)
 
+    def execution_gate(
+        self,
+        *,
+        order_id: str,
+        idempotency_key: str,
+        integration_id: str,
+        integration_version: str,
+        action_id: str,
+        input: Any,
+        target_schema: Mapping[str, Any],
+        acceptance_criteria: Any,
+        expires_at: str | int | None,
+        max_amount_atomic: int,
+        wallet_key: Optional[Any] = None,
+        keypair_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Purchase one private-pilot execution with one paid attempt at most."""
+        self._validate_execution_request(
+            order_id=order_id,
+            idempotency_key=idempotency_key,
+            integration_id=integration_id,
+            integration_version=integration_version,
+            action_id=action_id,
+            target_schema=target_schema,
+            expires_at=expires_at,
+            enforce_expiry_window=True,
+        )
+        if keypair_path and wallet_key is not None:
+            raise SDKError("Provide either wallet_key or keypair_path, not both.")
+        if (
+            isinstance(max_amount_atomic, bool)
+            or not isinstance(max_amount_atomic, int)
+            or max_amount_atomic <= 0
+        ):
+            raise SDKError("max_amount_atomic must be an explicit positive integer.")
+
+        criteria = _normalize_acceptance_criteria(acceptance_criteria)
+        commitment = build_acceptance_commitment(criteria)
+        body = {
+            "order_id": order_id,
+            "idempotency_key": idempotency_key,
+            "integration_id": integration_id,
+            "integration_version": integration_version,
+            "action_id": action_id,
+            "input": input,
+            "target_schema": dict(target_schema),
+            "acceptance_criteria": criteria,
+            "acceptance_commitment": commitment,
+            "expires_at": str(expires_at).strip(),
+        }
+        _canonical_json(body)
+
+        probe = self._post_json(EXECUTION_GATE_ENDPOINT, body)
+        if probe.status_code == 200:
+            binding = self._execution_binding_from_result(
+                probe,
+                request=body,
+                recovery_token=None,
+            )
+            if binding["amount_atomic"] > max_amount_atomic:
+                raise ProtocolError("Recovered execution price exceeds max_amount_atomic.")
+            return self._parse_execution_result(
+                probe,
+                binding=binding,
+                recovery_token=None,
+            )
+        if probe.status_code != 402:
+            self._raise_http_error(
+                probe, "Execution Gate preflight did not return a payment challenge"
+            )
+
+        encoded_required = probe.headers.get(PAYMENT_REQUIRED_HEADER)
+        if not encoded_required:
+            raise ProtocolError(
+                f"HTTP 402 response omitted {PAYMENT_REQUIRED_HEADER}."
+            )
+        payment_required = self._decode_base64_json(
+            encoded_required, PAYMENT_REQUIRED_HEADER
+        )
+        metadata = self._validate_payment_required(
+            payment_required,
+            expected_endpoint=EXECUTION_GATE_ENDPOINT,
+            expected_amount=None,
+            max_amount=max_amount_atomic,
+            require_amount_string=True,
+        )
+        binding, recovery = self._validate_execution_challenge(
+            metadata=metadata,
+            request=body,
+        )
+        self.last_recovery = recovery
+
+        try:
+            if not keypair_path and wallet_key is None:
+                raise SDKError(
+                    "A new execution requires wallet_key or a local Solana "
+                    "keypair_path."
+                )
+            payer = (
+                self._coerce_keypair(wallet_key)
+                if wallet_key is not None
+                else self._load_keypair(keypair_path or "")
+            )
+            if str(payer.pubkey()) == metadata.fee_payer:
+                raise ProtocolError(
+                    "Buyer authority cannot also be the facilitator fee payer."
+                )
+
+            core_client = x402ClientSync()
+            register_exact_svm_client(
+                core_client,
+                KeypairSigner(payer),
+                networks=SOLANA_NETWORK,
+                rpc_url=self.rpc_url,
+            )
+            http_client = x402HTTPClientSync(core_client)
+            response_headers = dict(probe.headers)
+            response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
+            try:
+                payment_headers, payment_payload = http_client.handle_402_response(
+                    response_headers,
+                    probe.content,
+                    probe.url,
+                )
+            except Exception as exc:
+                raise PaymentError(
+                    f"Could not create canonical exact-SVM payment payload: {exc}"
+                ) from exc
+            if payment_payload is None:
+                raise ProtocolError("x402 client did not create a payment payload.")
+            self._validate_payment_payload(
+                payment_headers,
+                metadata,
+                expected_endpoint=EXECUTION_GATE_ENDPOINT,
+                strict_resource=True,
+                strict_terms=True,
+            )
+
+            # Exactly one paid POST. Ambiguous failure is recovered by GET only.
+            paid_response = self._post_json(
+                EXECUTION_GATE_ENDPOINT,
+                body,
+                extra_headers=payment_headers,
+            )
+            if paid_response.status_code == 200:
+                return self._parse_execution_result(
+                    paid_response,
+                    binding=binding,
+                    recovery_token=recovery["token"],
+                )
+            if paid_response.status_code == 202:
+                pending = self._parse_execution_pending(
+                    paid_response,
+                    order_id=order_id,
+                )
+                pending.setdefault("recovery", recovery)
+                pending.setdefault(
+                    "payment_response",
+                    self._parse_execution_settlement(paid_response),
+                )
+                return pending
+            self._raise_http_error(
+                paid_response, "Execution Gate settlement or delivery failed"
+            )
+        except SDKError as exc:
+            if exc.recovery is None:
+                exc.recovery = dict(recovery)
+            raise
+
+    def recover_execution(
+        self,
+        *,
+        order_id: str,
+        recovery_token: str,
+        idempotency_key: str,
+        integration_id: str,
+        integration_version: str,
+        action_id: str,
+        input: Any,
+        target_schema: Mapping[str, Any],
+        acceptance_criteria: Any,
+        expires_at: str | int | None,
+    ) -> dict[str, Any]:
+        """Recover an execution using GET only; this path cannot create payment."""
+        self._validate_execution_request(
+            order_id=order_id,
+            idempotency_key=idempotency_key,
+            integration_id=integration_id,
+            integration_version=integration_version,
+            action_id=action_id,
+            target_schema=target_schema,
+            expires_at=expires_at,
+            enforce_expiry_window=False,
+        )
+        token = _execution_recovery_token(recovery_token)
+        criteria = _normalize_acceptance_criteria(acceptance_criteria)
+        request = {
+            "order_id": order_id,
+            "idempotency_key": idempotency_key,
+            "integration_id": integration_id,
+            "integration_version": integration_version,
+            "action_id": action_id,
+            "input": input,
+            "target_schema": dict(target_schema),
+            "acceptance_criteria": criteria,
+            "acceptance_commitment": build_acceptance_commitment(criteria),
+            "expires_at": str(expires_at).strip(),
+        }
+        _canonical_json(request)
+        url = (
+            "https://www.x402digitalvendingmachine.store/v1/executions/"
+            f"{quote(order_id, safe='')}"
+        )
+        recovery = {"url": url, "token": token}
+        self.last_recovery = recovery
+        response = self._get_json(
+            url,
+            extra_headers={
+                "Authorization": f"Bearer {token}",
+                "X-Recovery-Token": token,
+            },
+        )
+        if response.status_code == 200:
+            binding = self._execution_binding_from_result(
+                response,
+                request=request,
+                recovery_token=token,
+            )
+            return self._parse_execution_result(
+                response,
+                binding=binding,
+                recovery_token=token,
+            )
+        if response.status_code == 202:
+            pending = self._parse_execution_pending(response, order_id=order_id)
+            pending.setdefault("recovery", recovery)
+            return pending
+        try:
+            self._raise_http_error(response, "Execution Gate recovery failed")
+        except SDKError as exc:
+            exc.recovery = recovery
+            raise
+
+    @staticmethod
+    def _validate_execution_request(
+        *,
+        order_id: str,
+        idempotency_key: str,
+        integration_id: str,
+        integration_version: str,
+        action_id: str,
+        target_schema: Mapping[str, Any],
+        expires_at: str | int | None,
+        enforce_expiry_window: bool,
+    ) -> None:
+        _execution_identifier(order_id, "order_id")
+        if not isinstance(idempotency_key, str) or not 8 <= len(idempotency_key) <= 128:
+            raise SDKError("idempotency_key must be 8-128 characters.")
+        _execution_identifier(integration_id, "integration_id")
+        _execution_identifier(integration_version, "integration_version")
+        _execution_identifier(action_id, "action_id")
+        if not isinstance(target_schema, Mapping) or not target_schema:
+            raise SDKError("target_schema must be a non-empty JSON object.")
+        _execution_expires_epoch(expires_at, enforce_window=enforce_expiry_window)
+
+    def _validate_execution_challenge(
+        self,
+        *,
+        metadata: ChallengeMetadata,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        terms = metadata.execution_gate
+        expected_fields = {
+            "order_id", "integration_id", "integration_version", "action_id",
+            "environment", "audience", "request_hash", "configuration_hash",
+            "policy_hash", "qualification_report_hash", "expires_at",
+            "permit_ttl_seconds", "recovery",
+        }
+        if not isinstance(terms, dict) or set(terms) != expected_fields:
+            raise ProtocolError(
+                "Execution Gate challenge has malformed extensions.executionGate."
+            )
+        for field in (
+            "order_id", "integration_id", "integration_version", "action_id"
+        ):
+            if terms.get(field) != request[field]:
+                raise ProtocolError(f"Execution Gate challenge changed {field}.")
+        environment = terms.get("environment")
+        audience = terms.get("audience")
+        if not isinstance(environment, str) or not environment:
+            raise ProtocolError("Execution Gate challenge omitted environment.")
+        if not isinstance(audience, str) or not audience:
+            raise ProtocolError("Execution Gate challenge omitted audience.")
+        for field in (
+            "configuration_hash", "policy_hash", "qualification_report_hash"
+        ):
+            self._require_prefixed_hash(terms.get(field), f"challenge {field}")
+        if re.fullmatch(r"[0-9a-f]{64}", str(terms.get("request_hash"))) is None:
+            raise ProtocolError("Execution Gate challenge request_hash is invalid.")
+
+        buyer_expiry = _execution_expires_epoch(
+            request.get("expires_at"), enforce_window=False
+        )
+        try:
+            challenge_expiry = _execution_expires_epoch(
+                terms.get("expires_at"), enforce_window=False
+            )
+        except SDKError as exc:
+            raise ProtocolError("Execution Gate challenge expires_at is invalid.") from exc
+        now = int(datetime.now(timezone.utc).timestamp())
+        if (
+            challenge_expiry <= now
+            or challenge_expiry > buyer_expiry
+            or challenge_expiry > now + 600
+        ):
+            raise ProtocolError("Execution Gate challenge expiry is outside buyer terms.")
+        ttl = terms.get("permit_ttl_seconds")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 600:
+            raise ProtocolError("Execution Gate challenge permit_ttl_seconds is invalid.")
+
+        recovery = terms.get("recovery")
+        expected_url = (
+            "https://www.x402digitalvendingmachine.store/v1/executions/"
+            f"{quote(str(request['order_id']), safe='')}"
+        )
+        if not isinstance(recovery, dict) or set(recovery) != {"url", "token"}:
+            raise ProtocolError("Execution Gate challenge omitted recovery terms.")
+        if recovery.get("url") != expected_url:
+            raise ProtocolError("Execution Gate challenge changed the recovery URL.")
+        try:
+            token = _execution_recovery_token(recovery.get("token"))
+        except SDKError as exc:
+            raise ProtocolError("Execution Gate challenge recovery token is invalid.") from exc
+        timeout = metadata.accepted.get("maxTimeoutSeconds")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 600:
+            raise ProtocolError("Execution Gate payment timeout is invalid.")
+
+        binding = _execution_gate_binding(
+            order_id=str(request["order_id"]),
+            idempotency_key=str(request["idempotency_key"]),
+            integration_id=str(request["integration_id"]),
+            integration_version=str(request["integration_version"]),
+            action_id=str(request["action_id"]),
+            input=request["input"],
+            target_schema=request["target_schema"],
+            acceptance_criteria=request["acceptance_criteria"],
+            expires_at=request["expires_at"],
+            audience=audience,
+            environment=environment,
+            configuration_hash=str(terms["configuration_hash"]),
+            policy_hash=str(terms["policy_hash"]),
+            qualification_report_hash=str(terms["qualification_report_hash"]),
+            amount_atomic=metadata.amount_atomic,
+            recovery_token=token,
+        )
+        if terms["request_hash"] != binding["request_hash"]:
+            raise ProtocolError("Execution Gate challenge request_hash does not bind the request.")
+        return binding, {"url": expected_url, "token": token}
+
+    def _execution_binding_from_result(
+        self,
+        response: Response,
+        *,
+        request: Mapping[str, Any],
+        recovery_token: str | None,
+    ) -> dict[str, Any]:
+        outer = self._parse_json_object(response, "Execution Gate response")
+        receipt = outer.get("receipt")
+        payload = receipt.get("payload") if isinstance(receipt, dict) else None
+        if not isinstance(payload, dict):
+            raise ProtocolError("Execution Gate response omitted its receipt payload.")
+        amount = payload.get("amount_atomic")
+        if isinstance(amount, bool):
+            raise ProtocolError("Execution receipt amount_atomic is invalid.")
+        try:
+            amount_atomic = int(str(amount))
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("Execution receipt amount_atomic is invalid.") from exc
+        return _execution_gate_binding(
+            order_id=str(request["order_id"]),
+            idempotency_key=str(request["idempotency_key"]),
+            integration_id=str(request["integration_id"]),
+            integration_version=str(request["integration_version"]),
+            action_id=str(request["action_id"]),
+            input=request["input"],
+            target_schema=request["target_schema"],
+            acceptance_criteria=request["acceptance_criteria"],
+            expires_at=request["expires_at"],
+            audience=str(payload.get("audience", "")),
+            environment=str(payload.get("environment", "")),
+            configuration_hash=str(payload.get("configuration_hash", "")),
+            policy_hash=str(payload.get("policy_hash", "")),
+            qualification_report_hash=str(
+                payload.get("qualification_report_hash", "")
+            ),
+            amount_atomic=amount_atomic,
+            recovery_token=recovery_token,
+        )
+
     def recover_order(
         self,
         *,
@@ -757,6 +1305,7 @@ class X402ClientSDK:
         expected_endpoint: str | None = None,
         expected_amount: int | None = PAYMENT_AMOUNT_ATOMIC,
         max_amount: int | None = None,
+        require_amount_string: bool = False,
     ) -> ChallengeMetadata:
         if payment_required.get("x402Version") != 2:
             raise ProtocolError("Payment challenge must use x402Version 2.")
@@ -789,6 +1338,13 @@ class X402ClientSDK:
                 "and the pinned recipient."
             )
         amount = accepted.get("amount")
+        if require_amount_string and (
+            not isinstance(amount, str)
+            or re.fullmatch(r"[1-9][0-9]*", amount) is None
+        ):
+            raise ProtocolError(
+                "Payment amount must be a canonical positive integer string."
+            )
         try:
             amount_atomic = int(str(amount))
         except (TypeError, ValueError) as exc:
@@ -828,10 +1384,14 @@ class X402ClientSDK:
 
         extensions = payment_required.get("extensions")
         schema_gate: dict[str, Any] | None = None
+        execution_gate: dict[str, Any] | None = None
         if isinstance(extensions, dict):
             candidate = extensions.get("schemaGate")
             if isinstance(candidate, dict):
                 schema_gate = candidate
+            execution_candidate = extensions.get("executionGate")
+            if isinstance(execution_candidate, dict):
+                execution_gate = execution_candidate
 
         return ChallengeMetadata(
             resource=resource,
@@ -841,6 +1401,7 @@ class X402ClientSDK:
             challenge_id=challenge_id.strip(),
             amount_atomic=amount_atomic,
             schema_gate=schema_gate,
+            execution_gate=execution_gate,
         )
 
     def _validate_payment_payload(
@@ -849,6 +1410,8 @@ class X402ClientSDK:
         metadata: ChallengeMetadata,
         *,
         expected_endpoint: str | None = None,
+        strict_resource: bool = False,
+        strict_terms: bool = False,
     ) -> None:
         encoded = self._mapping_header(headers, PAYMENT_SIGNATURE_HEADER)
         if not encoded:
@@ -861,9 +1424,17 @@ class X402ClientSDK:
         resource = envelope.get("resource")
         if not isinstance(resource, dict) or resource.get("url") != pinned_endpoint:
             raise ProtocolError("Generated payment payload changed the resource.")
+        if strict_resource and _canonical_json(resource) != _canonical_json(
+            metadata.resource
+        ):
+            raise ProtocolError("Generated payment payload changed the resource metadata.")
         generated_terms = envelope.get("accepted")
         if not isinstance(generated_terms, dict):
             raise ProtocolError("Generated payment payload omitted accepted terms.")
+        if strict_terms and _canonical_json(generated_terms) != _canonical_json(
+            metadata.accepted
+        ):
+            raise ProtocolError("Generated payment payload changed accepted terms.")
         for field in ("scheme", "network", "amount", "asset", "payTo"):
             if generated_terms.get(field) != metadata.accepted.get(field):
                 raise ProtocolError(
@@ -946,6 +1517,291 @@ class X402ClientSDK:
         result.setdefault("acceptance_commitment", binding["acceptance_commitment"])
         result["receipt_verified"] = True
         return result
+
+    def _parse_execution_result(
+        self,
+        response: Response,
+        *,
+        binding: Mapping[str, Any],
+        recovery_token: str | None,
+    ) -> dict[str, Any]:
+        outer = self._parse_json_object(response, "Execution Gate response")
+        if outer.get("order_id") != binding["order_id"]:
+            raise ProtocolError("Execution Gate response changed order_id.")
+        if outer.get("status") != "delivered":
+            raise ProtocolError("Execution Gate response status must be delivered.")
+        if outer.get("payment_settled") is not True:
+            raise ProtocolError("Execution Gate response did not confirm settlement.")
+        delivery = outer.get("delivery")
+        if not isinstance(delivery, dict) or not isinstance(delivery.get("recovered"), bool):
+            raise ProtocolError("Execution Gate response delivery is malformed.")
+        result = outer.get("result")
+        if not isinstance(result, dict):
+            raise ProtocolError("Execution Gate response omitted result.")
+        receipt = outer.get("receipt")
+        if not isinstance(receipt, dict):
+            raise ProtocolError("Execution Gate response omitted its signed receipt.")
+        settlement = self._parse_execution_settlement(response)
+        self._verify_execution_receipt(
+            outer=outer,
+            result=result,
+            receipt=receipt,
+            settlement=settlement,
+            binding=binding,
+            recovery_token=recovery_token,
+        )
+        outer["receipt_verified"] = True
+        outer["prepare_verified"] = True
+        outer["commit_verified"] = True
+        outer["execution_verified"] = True
+        outer.setdefault("payment_response", settlement)
+        return outer
+
+    def _parse_execution_pending(
+        self,
+        response: Response,
+        *,
+        order_id: str,
+    ) -> dict[str, Any]:
+        pending = self._parse_json_object(response, "Execution Gate pending response")
+        if pending.get("order_id") != order_id:
+            raise ProtocolError("Execution recovery response changed order_id.")
+        if not isinstance(pending.get("status"), str) or not pending["status"]:
+            raise ProtocolError("Execution recovery response omitted status.")
+        if pending.get("payment_settled") is not True:
+            raise ProtocolError("Execution recovery response did not confirm settlement.")
+        if pending.get("outcome_unknown") is not True:
+            raise ProtocolError("Execution recovery response must mark outcome_unknown.")
+        pending["execution_verified"] = False
+        return pending
+
+    def _parse_execution_settlement(self, response: Response) -> dict[str, Any]:
+        encoded = response.headers.get("PAYMENT-RESPONSE")
+        if not encoded:
+            raise ProtocolError("Execution response omitted PAYMENT-RESPONSE.")
+        settlement = self._decode_base64_json(encoded, "PAYMENT-RESPONSE")
+        if settlement.get("success") is not True:
+            reason = settlement.get("errorReason") or settlement.get("error")
+            raise PaymentError(
+                f"Facilitator did not confirm settlement: {reason or settlement}"
+            )
+        if "network" in settlement and settlement.get("network") != SOLANA_NETWORK:
+            raise ProtocolError("Settlement response changed the network.")
+        transaction = settlement.get("transaction")
+        if not isinstance(transaction, str) or not transaction:
+            raise ProtocolError("Settlement response omitted transaction.")
+        return settlement
+
+    def _verify_execution_receipt(
+        self,
+        *,
+        outer: Mapping[str, Any],
+        result: Mapping[str, Any],
+        receipt: Mapping[str, Any],
+        settlement: Mapping[str, Any],
+        binding: Mapping[str, Any],
+        recovery_token: str | None,
+    ) -> None:
+        protected = receipt.get("protected")
+        payload = receipt.get("payload")
+        encoded_signature = receipt.get("signature")
+        if not isinstance(protected, dict) or set(protected) != {"alg", "kid", "typ"}:
+            raise ProtocolError("Execution receipt protected header is malformed.")
+        if protected.get("alg") != "ES256":
+            raise ProtocolError("Execution receipt algorithm must be ES256.")
+        if protected.get("typ") != EXECUTION_GATE_RECEIPT_TYPE:
+            raise ProtocolError("Execution receipt protected header has the wrong type.")
+        kid = protected.get("kid")
+        if not isinstance(kid, str) or not kid:
+            raise ProtocolError("Execution receipt protected header omitted kid.")
+        if not isinstance(payload, dict) or not isinstance(encoded_signature, str):
+            raise ProtocolError("Execution receipt payload or signature is malformed.")
+        self._verify_execution_signature(
+            protected=protected,
+            payload=payload,
+            encoded_signature=encoded_signature,
+            kid=kid,
+        )
+
+        required_payload_fields = {
+            "receipt_version", "service", "environment", "audience",
+            "integration_id", "integration_version", "action_id", "order_id",
+            "idempotency_hash", "request_hash", "configuration_hash",
+            "policy_hash", "qualification_report_hash", "payload_hash",
+            "dispatch_nonce", "payment_id", "network", "asset", "recipient",
+            "amount_atomic", "payer", "settlement_id", "prepare_jti",
+            "prepare_permit_hash", "prepare_ack_hash", "commit_jti",
+            "commit_permit_hash", "commit_ack_hash", "effect_id",
+            "effect_ack_hash", "result_hash", "recovery_url",
+            "recovery_token_hash", "executed_at", "issued_at",
+        }
+        if set(payload) != required_payload_fields:
+            raise ProtocolError("Execution receipt payload fields are malformed.")
+        expected = {
+            "receipt_version": 1,
+            "service": "x402-execution-gate",
+            "environment": binding["environment"],
+            "audience": binding["audience"],
+            "integration_id": binding["integration_id"],
+            "integration_version": binding["integration_version"],
+            "action_id": binding["action_id"],
+            "order_id": binding["order_id"],
+            "idempotency_hash": binding["idempotency_hash"],
+            "request_hash": binding["request_hash"],
+            "configuration_hash": binding["configuration_hash"],
+            "policy_hash": binding["policy_hash"],
+            "qualification_report_hash": binding["qualification_report_hash"],
+            "payload_hash": binding["payload_hash"],
+            "network": SOLANA_NETWORK,
+            "asset": USDC_MINT,
+            "recipient": RECIPIENT_WALLET,
+            "amount_atomic": binding["amount_atomic"],
+        }
+        for field, expected_value in expected.items():
+            actual = payload.get(field)
+            if field == "amount_atomic" and not isinstance(actual, bool):
+                try:
+                    actual = int(str(actual))
+                except (TypeError, ValueError):
+                    pass
+            if actual != expected_value:
+                raise ProtocolError(f"Execution receipt changed {field}.")
+
+        for field in (
+            "configuration_hash", "policy_hash", "qualification_report_hash",
+            "payload_hash", "prepare_permit_hash", "prepare_ack_hash",
+            "commit_permit_hash", "commit_ack_hash", "effect_id",
+            "effect_ack_hash", "result_hash",
+        ):
+            self._require_prefixed_hash(payload.get(field), f"receipt {field}")
+        for field in ("idempotency_hash", "request_hash", "recovery_token_hash"):
+            if re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field))) is None:
+                raise ProtocolError(f"Execution receipt {field} is invalid.")
+        for field in (
+            "dispatch_nonce", "payment_id", "payer", "settlement_id",
+            "prepare_jti", "commit_jti", "executed_at", "issued_at",
+        ):
+            if not isinstance(payload.get(field), str) or not payload[field]:
+                raise ProtocolError(f"Execution receipt omitted {field}.")
+        if payload["prepare_jti"] == payload["commit_jti"]:
+            raise ProtocolError("Execution receipt PREPARE and COMMIT JTIs must differ.")
+        if payload["effect_ack_hash"] != payload["commit_ack_hash"]:
+            raise ProtocolError("Execution receipt effect_ack_hash does not bind COMMIT.")
+
+        required_result_fields = {
+            "status", "nonce", "aud", "integration_id", "integration_version",
+            "action_id", "configuration_hash", "policy_hash", "payload_hash",
+            "order_id", "settlement_id", "effect_id", "executed_at",
+        }
+        if set(result) != required_result_fields or result.get("status") != "EXECUTED":
+            raise ProtocolError("Execution result is malformed or not EXECUTED.")
+        result_bindings = {
+            "nonce": payload["dispatch_nonce"],
+            "aud": binding["audience"],
+            "integration_id": binding["integration_id"],
+            "integration_version": binding["integration_version"],
+            "action_id": binding["action_id"],
+            "configuration_hash": binding["configuration_hash"],
+            "policy_hash": binding["policy_hash"],
+            "payload_hash": binding["payload_hash"],
+            "order_id": binding["order_id"],
+            "settlement_id": payload["settlement_id"],
+            "effect_id": payload["effect_id"],
+            "executed_at": payload["executed_at"],
+        }
+        for field, expected_value in result_bindings.items():
+            if result.get(field) != expected_value:
+                raise ProtocolError(f"Execution result changed {field}.")
+        expected_result_hash = "sha256:" + _sha256_text(_canonical_json(dict(result)))
+        if payload["result_hash"] != expected_result_hash:
+            raise ProtocolError("Execution receipt result_hash does not bind result.")
+        if payload["settlement_id"] != settlement.get("transaction"):
+            raise ProtocolError("Execution settlement_id does not bind PAYMENT-RESPONSE.")
+        if payload["recovery_url"] != binding["recovery_url"]:
+            raise ProtocolError("Execution receipt changed recovery_url.")
+        if recovery_token is not None:
+            expected_token_hash = _sha256_text(recovery_token)
+            if payload["recovery_token_hash"] != expected_token_hash:
+                raise ProtocolError("Execution receipt changed recovery_token_hash.")
+        elif binding.get("recovery_token_hash") is not None:
+            if payload["recovery_token_hash"] != binding["recovery_token_hash"]:
+                raise ProtocolError("Execution receipt changed recovery_token_hash.")
+        if outer.get("order_id") != payload["order_id"]:
+            raise ProtocolError("Execution receipt does not bind outer order_id.")
+
+    @staticmethod
+    def _require_prefixed_hash(value: Any, field: str) -> None:
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)) is None:
+            raise ProtocolError(f"Execution {field} must be sha256:<lowercase hex>.")
+
+    def _verify_execution_signature(
+        self,
+        *,
+        protected: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        encoded_signature: str,
+        kid: str,
+    ) -> None:
+        jwk = self._load_execution_receipt_jwk(kid)
+        try:
+            x_bytes = self._base64url_decode(str(jwk["x"]))
+            y_bytes = self._base64url_decode(str(jwk["y"]))
+            signature = self._base64url_decode(encoded_signature)
+            if len(x_bytes) != 32 or len(y_bytes) != 32 or len(signature) != 64:
+                raise ValueError("invalid ES256 coordinate or signature length")
+            public_key = ec.EllipticCurvePublicNumbers(
+                int.from_bytes(x_bytes, "big"),
+                int.from_bytes(y_bytes, "big"),
+                ec.SECP256R1(),
+            ).public_key()
+            der_signature = encode_dss_signature(
+                int.from_bytes(signature[:32], "big"),
+                int.from_bytes(signature[32:], "big"),
+            )
+            signing_input = (
+                self._base64url_encode(_canonical_json(dict(protected)).encode())
+                + "."
+                + self._base64url_encode(_canonical_json(dict(payload)).encode())
+            ).encode("ascii")
+            public_key.verify(der_signature, signing_input, ec.ECDSA(hashes.SHA256()))
+        except InvalidSignature as exc:
+            raise ProtocolError("Execution receipt ES256 signature is invalid.") from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProtocolError("Execution receipt key or signature encoding is invalid.") from exc
+
+    def _load_execution_receipt_jwk(self, kid: str) -> dict[str, Any]:
+        cached = self._execution_receipt_keys.get(kid)
+        if cached is not None:
+            return cached
+        response = self._get_json(EXECUTION_RECEIPT_KEY_ENDPOINT)
+        if response.status_code != 200:
+            self._raise_http_error(response, "Execution receipt JWKS lookup failed")
+        document = self._parse_json_object(response, "execution receipt JWKS")
+        if document.get("receipt_type") != EXECUTION_GATE_RECEIPT_TYPE:
+            raise ProtocolError("Execution receipt JWKS has the wrong receipt_type.")
+        if document.get("service") != "x402-execution-gate":
+            raise ProtocolError("Execution receipt JWKS has the wrong service.")
+        keys = document.get("keys")
+        if not isinstance(keys, list):
+            raise ProtocolError("Execution receipt JWKS omitted keys[].")
+        published: dict[str, dict[str, Any]] = {}
+        for item in keys:
+            if not isinstance(item, dict) or not isinstance(item.get("kid"), str):
+                raise ProtocolError("Execution receipt JWKS contains a malformed key.")
+            required = {
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
+            }
+            for field, expected_value in required.items():
+                if item.get(field) != expected_value:
+                    raise ProtocolError(f"Execution receipt JWK has invalid {field}.")
+            if not isinstance(item.get("x"), str) or not isinstance(item.get("y"), str):
+                raise ProtocolError("Execution receipt JWK omitted P-256 coordinates.")
+            published[item["kid"]] = dict(item)
+        self._execution_receipt_keys.update(published)
+        selected = self._execution_receipt_keys.get(kid)
+        if selected is None:
+            raise ProtocolError("Execution receipt kid is not published by the service.")
+        return selected
 
     def _verify_receipt(
         self,

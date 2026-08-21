@@ -84,3 +84,46 @@ order and one paid evaluation. The SDK is free to integrate.
 
 This repository does not claim PyPI publication, MCP registry acceptance,
 external demand, or revenue.
+
+## Private-pilot Execution Gate
+
+Execution Gate is a private pilot for explicitly enabled integrations. It is
+not a universal execution layer and is not currently advertised in the public
+x402 manifest, OpenAPI document, `llms.txt`, or MCP descriptor. SDK symbols do
+not imply general availability or compatibility with arbitrary execution
+targets.
+
+```python
+from datetime import datetime, timedelta, timezone
+
+execution = client.execution_gate(
+    order_id="execution-1042",
+    idempotency_key="execution-1042-v1",
+    integration_id="canary",
+    integration_version="v1",
+    action_id="commit",
+    input={"sku": "A-7", "quantity": 2},
+    target_schema={"type": "object"},
+    acceptance_criteria=criteria,
+    expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    max_amount_atomic=17_500,  # Illustrative ceiling, not a quoted price.
+    keypair_path="~/.config/solana/id.json",
+)
+```
+
+`max_amount_atomic` is mandatory and has no SDK default. It is a hard caller
+ceiling, not a quote or promised price; the SDK rejects a challenged amount
+above it. The server price is bound into the payment and the dedicated ES256
+execution receipt. That receipt also binds integration identity and policy,
+PREPARE and COMMIT hashes, the effect acknowledgement, result, settlement, and
+recovery token hash. Public verification keys, including retained rotation
+keys, are read from `/.well-known/execution-gate-receipt-jwks.json`.
+
+If paid delivery is ambiguous, use `client.last_recovery` or
+`SDKError.recovery`, then call `client.recover_execution(...)` with the exact
+original request fields, `expires_at`, and server-issued token. Recovery is a
+GET-only operation and never loads a wallet, signs a transaction, or creates a
+payment.
+
+The pilot does not guarantee support for every provider or action, execution
+success, customer adoption, demand, revenue, or continued availability.
