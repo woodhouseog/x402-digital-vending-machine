@@ -108,11 +108,5 @@ verify the signed receipt rather than trusting an order ID alone.
 - MCP descriptor: [`mcp-x402-server-definition.json`](mcp-x402-server-definition.json)
 - Client guide: [`docs_CLIENT_GUIDE.md`](docs_CLIENT_GUIDE.md)
 
-## Legacy compatibility
-
-`clean_text(...)` remains importable for existing clients at its separate
-legacy endpoint and price of `0.002 USDC` (`2000` atomic). It is not the Schema
-Gate product and is intentionally excluded from primary discovery metadata.
-
 Keep wallet secrets local. Never put a seed phrase or private key in source
 control, discovery documents, browser code, or request bodies.
