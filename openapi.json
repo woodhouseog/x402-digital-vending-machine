@@ -1,0 +1,125 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "x402 Digital Vending Machine",
+    "version": "2.0.0",
+    "description": "Pay-per-call whitespace normalization protected by canonical x402 v2 exact Solana USDC payment."
+  },
+  "servers": [
+    {
+      "url": "https://www.x402digitalvendingmachine.store"
+    }
+  ],
+  "paths": {
+    "/v1/clean": {
+      "post": {
+        "operationId": "cleanText",
+        "summary": "Normalize text after payment settlement",
+        "parameters": [
+          {
+            "name": "PAYMENT-SIGNATURE",
+            "in": "header",
+            "required": false,
+            "description": "Base64-encoded canonical x402 v2 PaymentPayload.",
+            "schema": {
+              "type": "string",
+              "contentEncoding": "base64"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment settled and normalized output delivered.",
+            "headers": {
+              "PAYMENT-RESPONSE": {
+                "description": "Base64-encoded x402 v2 SettlementResponse.",
+                "schema": {
+                  "type": "string",
+                  "contentEncoding": "base64"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleanResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON or invalid text input."
+          },
+          "402": {
+            "description": "Payment is required or the supplied payment was rejected.",
+            "headers": {
+              "PAYMENT-REQUIRED": {
+                "description": "Base64-encoded x402 v2 PaymentRequired object.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "contentEncoding": "base64"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The payment payload cannot be reused for a different request."
+          },
+          "429": {
+            "description": "Request rate limit exceeded."
+          },
+          "502": {
+            "description": "Payment settlement is temporarily unavailable."
+          }
+        },
+        "x-x402": {
+          "x402Version": 2,
+          "scheme": "exact",
+          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "amount": "2000",
+          "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD"
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CleanResponse": {
+        "type": "object",
+        "required": ["cleaned_text", "endpoint", "payment"],
+        "properties": {
+          "cleaned_text": {
+            "type": "string"
+          },
+          "endpoint": {
+            "const": "/v1/clean"
+          },
+          "payment": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    }
+  }
+}

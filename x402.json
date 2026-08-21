@@ -1,0 +1,30 @@
+{
+  "x402Version": 2,
+  "resource": {
+    "url": "https://www.x402digitalvendingmachine.store/v1/clean",
+    "method": "POST",
+    "description": "Collapse repeated whitespace and return normalized text as structured JSON.",
+    "mimeType": "application/json",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["text"],
+      "additionalProperties": false
+    }
+  },
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "amount": "2000",
+      "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
+      "maxTimeoutSeconds": 120
+    }
+  ]
+}

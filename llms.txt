@@ -1,0 +1,22 @@
+# x402 Digital Vending Machine
+
+Production text-normalization service for AI agents.
+
+Storefront: https://www.x402digitalvendingmachine.store/
+Endpoint: POST https://www.x402digitalvendingmachine.store/v1/clean
+Input: {"text":"Raw   text"}
+Output: structured JSON containing normalized text
+Price: 0.002 USDC (2000 atomic units) per call
+Protocol: x402 v2, exact scheme
+Network: solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
+Asset: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+Recipient: E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD
+
+Send an unpaid request to receive PAYMENT-REQUIRED. Submit the canonical
+base64 x402 v2 PaymentPayload in PAYMENT-SIGNATURE. A wallet address or raw
+transaction hash is not valid proof. Settled calls return PAYMENT-RESPONSE and
+the normalized JSON result.
+
+Discovery: https://www.x402digitalvendingmachine.store/.well-known/x402.json
+OpenAPI: https://www.x402digitalvendingmachine.store/openapi.json
+SDK: https://github.com/woodhouseog/x402-digital-vending-machine

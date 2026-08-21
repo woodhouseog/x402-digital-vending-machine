@@ -1,18 +1,48 @@
 {
+  "schemaVersion": "1.0",
   "id": "x402-digital-vending-machine",
-  "name": "X402 Digital Vending Machine",
-  "version": "1.0.0",
-  "description": "Pay-per-call text-cleanup and whitespace-normalization tool on Solana using x402.",
-  "capabilities": [
-    "text_cleanup",
-    "whitespace_normalization"
+  "name": "x402 Digital Vending Machine",
+  "version": "2.0.0",
+  "description": "Pay-per-call text normalization for AI agents using canonical x402 v2 exact Solana USDC payments.",
+  "homepage": "https://www.x402digitalvendingmachine.store/",
+  "tools": [
+    {
+      "name": "clean_text",
+      "description": "Collapse repeated whitespace and return normalized text as structured JSON.",
+      "transport": "https",
+      "method": "POST",
+      "endpoint": "https://www.x402digitalvendingmachine.store/v1/clean",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      }
+    }
   ],
-  "endpoint": "https://x402digitalvendingmachine.store",
-  "protocol": {
-    "name": "x402",
-    "version": "2.0",
+  "payment": {
+    "protocol": "x402",
+    "version": 2,
+    "scheme": "exact",
+    "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+    "amount": "2000",
+    "displayAmount": "0.002 USDC",
+    "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
-    "asset": "USDC",
-    "amount": "0.002"
+    "headers": {
+      "challenge": "PAYMENT-REQUIRED",
+      "payment": "PAYMENT-SIGNATURE",
+      "settlement": "PAYMENT-RESPONSE",
+      "encoding": "base64-json"
+    }
+  },
+  "discovery": {
+    "x402": "https://www.x402digitalvendingmachine.store/.well-known/x402.json",
+    "openapi": "https://www.x402digitalvendingmachine.store/openapi.json"
   }
 }

@@ -1,78 +1,85 @@
-# Python
+# Python caches and environments
 __pycache__/
 *.py[cod]
 *.so
 .Python
 .venv/
-env/
 venv/
+env/
 ENV/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Runtime and operational artifacts
+# JavaScript dependencies and build output
+node_modules/
+.next/
+coverage/
+
+# Secrets, credentials, keypairs, and environment files
+.env
+.env.*
+!.env.example
+*password*
+*credential*
+secret*
+secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id.json
+keypair*.json
+wallet*.json
+dashboard-owner-password.txt
+
+# Databases, journals, runtime state, logs, and process files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.wal
+*.shm
 *.log
-server_stdout.log
-launchd.log
-server.log
 *.pid
 *.out
 *.err
-
-# Databases and state
-*.db
-*.sqlite
-*.sqlite3
-payment_registry.db
-launchers/*.db
-
-# Secrets and env
-.env
-.env.*
-*.pem
-*.key
-*.crt
-id_rsa
-id_ed25519
-secrets.txt
-secret*
-
-# Backup and snapshots
-/backups/
-/*.backup
-/*.bak
-backup_*.log
-
-# OS/editor
-.DS_Store
-Thumbs.db
-*~
-*.swp
-*.swo
-.vscode/
-.idea/
-
-# Local runtime artifacts
-.server_daemon.pid
-.server_run.pid
-.pid
+.server*
+.cloudflared*
+.launcher*
 .locks/
-launch-live.ready-bundle.json
-launch-live.ready-host.json
-server_stdout.log
+logs/
 
-# Temp files
-/tmp/
+# Payment proofs and generated operational bundles
+payment_proof*.json
+launch-live.ready-*.json
+production-bundle-*.tar.gz
+*.backup
+*.bak
+backup_*.log
+backups/
 tmp/
 *.tmp
 
-# Added to protect operator runtime/session artifacts
-*.tar.gz
-logs/
-.cloudflared*
-.launcher*
-payment_registry.db.backup_*
-production-bundle-*.tar.gz
+# Local deployment projects, upstream clones, and legacy app surfaces
+/cloud-api/
+/awesome-eliza/
+/awesome-mcp-servers/
+/awesome-solana-ai/
+/solana-agent-kit/
+/CRYPTO/
+/CRYPTO copy/
+/static/
+/templates/
+/src/
+
+# Local launch and deployment helpers
 CLOUDFLARE_PROXY_SHIELD.md
-CRYPTO
 DEPLOY_TO_VPS.md
 Dockerfile
 docker-compose.yml
@@ -87,3 +94,12 @@ start-server-daemon.command
 stop-server-daemon.command
 test_server.py
 test_x402_protocol.py
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

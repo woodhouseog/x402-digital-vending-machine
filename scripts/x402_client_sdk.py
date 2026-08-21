@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""Python client wrapper for the x402 Solana USDC text-cleaning endpoint.
+"""Canonical x402 v2 exact-SVM client for the text-cleanup service.
 
-The client handles the two-step x402 flow:
-1) Probe the cleaning endpoint and capture PAYMENT-REQUIRED challenge metadata.
-2) Submit a funded Solana USDC transfer via an optional local keypair,
-   then retry the request with a PAYMENT-SIGNATURE proof header.
-
-Usage:
-    python3 scripts/x402_client_sdk.py \
-      --text "Messy   text   goes   here" \
-      --keypair ~/.config/solana/id.json
+The buyer signs only the transfer-authority portion of the transaction. The
+facilitator supplies the fee-payer signature, broadcasts, and settles it. This
+client never broadcasts a payment itself.
 """
 
 from __future__ import annotations
@@ -17,486 +11,452 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import time
-from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Mapping, Optional
 
 import requests
 from base58 import b58decode
-from requests import Response
+from requests import Response, Session
 from solders.keypair import Keypair
-from solders.instruction import AccountMeta
-from solders.pubkey import Pubkey
-from solders.instruction import Instruction
-from solders.sysvar import RENT as SYSVAR_RENT_ACCOUNT
-from solders.transaction import Transaction
+from x402 import x402ClientSync
+from x402.http import x402HTTPClientSync
+from x402.mechanisms.svm import KeypairSigner
+from x402.mechanisms.svm.exact.register import register_exact_svm_client
 
-from solana.rpc.api import Client
 
-# Staticly pinned Solana production values for this service.
-SERVICE_ENDPOINT = "https://x402digitalvendingmachine.store/v1/clean"
+SERVICE_ENDPOINT = "https://www.x402digitalvendingmachine.store/v1/clean"
 MAINNET_RPC = "https://api.mainnet-beta.solana.com"
-USDC_MINT = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RECIPIENT_WALLET = "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD"
-SERVICE_ASSET = str(USDC_MINT)
+PAYMENT_AMOUNT_ATOMIC = 2_000
 USDC_DECIMALS = 6
-PAYMENT_AMOUNT_USDC = Decimal("0.002")
-
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-SYSTEM_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
-SYSVAR_RENT_PUBKEY = SYSVAR_RENT_ACCOUNT
-
-
-@dataclass
-class ChallengeMetadata:
-    """Normalized challenge fields used to produce a payment signature."""
-
-    recipient: str
-    amount: int
-    mint: str
-    network: str = SOLANA_NETWORK
-    asset_contract: str = SERVICE_ASSET
+PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED"
+PAYMENT_SIGNATURE_HEADER = "PAYMENT-SIGNATURE"
 
 
 class SDKError(RuntimeError):
-    pass
+    """Base error raised by the public SDK."""
+
+
+class ProtocolError(SDKError):
+    """The service returned terms outside the pinned production contract."""
+
+
+class PaymentError(SDKError):
+    """The canonical x402 payment could not be created or settled."""
+
+
+@dataclass(frozen=True)
+class ChallengeMetadata:
+    resource: dict[str, Any]
+    accepted: dict[str, Any]
+    fee_payer: str
+    memo: str
+    challenge_id: str
 
 
 class X402ClientSDK:
+    """One-call client for the pinned production cleanup endpoint."""
+
     def __init__(
         self,
         endpoint: str = SERVICE_ENDPOINT,
         rpc_url: str = MAINNET_RPC,
-        timeout_seconds: int = 30,
+        timeout_seconds: float = 30,
+        session: Session | None = None,
     ) -> None:
-        self.endpoint = endpoint
+        if endpoint.rstrip("/") != SERVICE_ENDPOINT:
+            raise SDKError(
+                "This production client is pinned to "
+                f"{SERVICE_ENDPOINT}; refusing endpoint {endpoint!r}."
+            )
+        self.endpoint = SERVICE_ENDPOINT
         self.rpc_url = rpc_url
         self.timeout_seconds = timeout_seconds
-        self.rpc = Client(rpc_url)
+        self.session = session or requests.Session()
 
     def clean_text(
         self,
         text: str,
         keypair_path: Optional[str] = None,
+        wallet_key: Optional[Any] = None,
         verify_signature: bool = True,
         keypair_timeout_seconds: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Run one full 402 loop and return the final JSON response payload."""
-        if not text:
+    ) -> dict[str, Any]:
+        """Buy one cleanup and return structured JSON plus settlement receipt.
+
+        The final two arguments remain accepted for source compatibility. The
+        canonical facilitator flow is synchronous, so the legacy client-side
+        broadcast controls no longer change payment behavior.
+        """
+        del verify_signature, keypair_timeout_seconds
+
+        if not isinstance(text, str) or not text.strip():
             raise SDKError("Text input must be a non-empty string.")
-
-        probe = self._post_clean({"text": text})
-
-        if probe.status_code == 200:
-            return self._parse_json_payload(probe, require_payment=False)
-
-        if probe.status_code != 402:
-            self._raise_http_error(probe, "Expected a paid challenge flow")
-
-        challenge_header = self._first_non_empty_header(
-            probe.headers,
-            "PAYMENT-REQUIRED",
-            "PAYMENT",
-            "X-PAYMENT",
-            "WWW-AUTHENTICATE",
-        )
-        if not challenge_header:
-            self._raise_http_error(
-                probe,
-                "Challenge response did not include PAYMENT-REQUIRED proof metadata",
-            )
-
-        challenge = self._decode_challenge(challenge_header)
-        challenge_meta = self._extract_challenge_metadata(challenge)
-
-        if not keypair_path:
+        if keypair_path and wallet_key is not None:
+            raise SDKError("Provide either wallet_key or keypair_path, not both.")
+        if not keypair_path and wallet_key is None:
             raise SDKError(
-                "Purchase is required for this operation. Provide --keypair or set "
-                "--keypair to a local Solana keypair JSON file path."
+                "Purchase requires wallet_key or a local Solana keypair_path."
             )
 
-        payer = self._load_keypair(keypair_path)
-        signature = self._pay_and_capture_signature(
-            payer,
-            challenge_meta,
-            keypair_timeout_seconds=keypair_timeout_seconds,
-            verify_signature=verify_signature,
+        probe = self._post_clean(text)
+        if probe.status_code == 200:
+            return self._parse_json_object(probe, "service response")
+        if probe.status_code != 402:
+            self._raise_http_error(probe, "Expected an x402 payment challenge")
+
+        encoded_required = probe.headers.get(PAYMENT_REQUIRED_HEADER)
+        if not encoded_required:
+            raise ProtocolError(
+                f"HTTP 402 response omitted {PAYMENT_REQUIRED_HEADER}."
+            )
+        payment_required = self._decode_base64_json(
+            encoded_required, PAYMENT_REQUIRED_HEADER
         )
+        metadata = self._validate_payment_required(payment_required)
 
-        final_response = self._post_clean(
-            {"text": text},
-            proof_signature=signature,
-            proof_payload=challenge,
+        payer = (
+            self._coerce_keypair(wallet_key)
+            if wallet_key is not None
+            else self._load_keypair(keypair_path or "")
         )
+        if str(payer.pubkey()) == metadata.fee_payer:
+            raise ProtocolError(
+                "Buyer authority cannot also be the facilitator fee payer."
+            )
 
-        if final_response.status_code != 200:
-            self._raise_http_error(final_response, "Payment unlock flow did not complete")
+        core_client = x402ClientSync()
+        register_exact_svm_client(
+            core_client,
+            KeypairSigner(payer),
+            networks=SOLANA_NETWORK,
+            rpc_url=self.rpc_url,
+        )
+        http_client = x402HTTPClientSync(core_client)
 
-        return self._parse_json_payload(final_response, require_payment=False)
+        response_headers = dict(probe.headers)
+        response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
+        try:
+            payment_headers, payment_payload = http_client.handle_402_response(
+                response_headers,
+                probe.content,
+                probe.url,
+            )
+        except Exception as exc:
+            raise PaymentError(
+                f"Could not create canonical exact-SVM payment payload: {exc}"
+            ) from exc
+        if payment_payload is None:
+            raise ProtocolError("x402 client did not create a payment payload.")
+        self._validate_payment_payload(payment_headers, metadata)
+
+        # Exactly one paid resubmission. Never automatically replay a monetary
+        # request after an ambiguous connection failure.
+        paid_response = self._post_clean(text, extra_headers=payment_headers)
+        try:
+            processed = http_client.process_payment_result(
+                payment_payload,
+                lambda name: paid_response.headers.get(name),
+                paid_response.status_code,
+            )
+        except Exception as exc:
+            raise ProtocolError(
+                f"Invalid PAYMENT-RESPONSE settlement header: {exc}"
+            ) from exc
+
+        settle_response = processed.settle_response
+        if paid_response.status_code != 200:
+            if settle_response is not None:
+                settlement_error = settle_response.model_dump(
+                    mode="json", by_alias=True
+                )
+                raise PaymentError(
+                    "Facilitator rejected settlement: "
+                    f"{settlement_error.get('errorReason') or settlement_error}"
+                )
+            self._raise_http_error(
+                paid_response, "x402 settlement or service delivery failed"
+            )
+        if settle_response is None:
+            raise ProtocolError("Paid response omitted PAYMENT-RESPONSE.")
+
+        settlement = settle_response.model_dump(mode="json", by_alias=True)
+        if settlement.get("success") is not True:
+            reason = settlement.get("errorReason") or settlement.get("error")
+            raise PaymentError(
+                f"Facilitator did not confirm settlement: {reason or settlement}"
+            )
+
+        result = self._parse_json_object(paid_response, "paid service response")
+        result.setdefault("payment_response", settlement)
+        return result
 
     def _post_clean(
         self,
-        payload: Dict[str, Any],
-        proof_signature: Optional[str] = None,
-        proof_payload: Optional[Dict[str, Any]] = None,
+        text: str,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Response:
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "User-Agent": "x402-client-sdk/1.0",
+        headers = {
             "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "x402-cleanup-client/2",
         }
-        if proof_signature:
-            headers["PAYMENT-SIGNATURE"] = proof_signature
-        elif proof_payload:
-            headers["PAYMENT"] = self._encode_payment_payload(proof_payload)
-
-        response = requests.post(
-            self.endpoint,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=self.timeout_seconds,
-        )
-
-        return response
-
-    def _pay_and_capture_signature(
-        self,
-        payer: Keypair,
-        challenge: ChallengeMetadata,
-        keypair_timeout_seconds: Optional[int] = None,
-        verify_signature: bool = True,
-    ) -> str:
-        """Build and submit the required USDC transfer transaction."""
-        mint = Pubkey.from_string(challenge.mint)
-        recipient = Pubkey.from_string(challenge.recipient)
-
-        sender_ata = self._derive_associated_token_address(payer.pubkey(), mint)
-        recipient_ata = self._derive_associated_token_address(recipient, mint)
-
-        instructions = []
-        if not self._account_exists(sender_ata):
-            instructions.append(self._create_associated_token_account_ix(payer.pubkey(), payer.pubkey(), mint, sender_ata))
-        if not self._account_exists(recipient_ata):
-            instructions.append(self._create_associated_token_account_ix(payer.pubkey(), recipient, mint, recipient_ata))
-
-        instructions.append(self._transfer_ata_ix(sender_ata, recipient_ata, payer.pubkey(), challenge.amount))
-
-        recent = self.rpc.get_latest_blockhash().value.blockhash
-        tx = Transaction.new_signed_with_payer(
-            instructions,
-            payer.pubkey(),
-            [payer],
-            recent,
-        )
-
-        signed_tx = bytes(tx)
-        send_response = self.rpc.send_raw_transaction(signed_tx)
-        if send_response.value is None:
-            raise SDKError(f"RPC rejected payment tx: {send_response}")
-
-        signature = str(send_response.value)
-
-        if verify_signature:
-            self._wait_for_confirmation(signature, max_wait=keypair_timeout_seconds or 90)
-
-        return signature
-
-    def _wait_for_confirmation(self, signature: str, max_wait: int = 90) -> None:
-        """Poll RPC status for the payment signature until finality or timeout."""
-        endpoint = self.rpc_url
-        deadline = time.time() + max_wait
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignatureStatuses",
-            "params": [[signature], {"searchTransactionHistory": True}],
-        }
-
-        while time.time() < deadline:
-            resp = requests.post(endpoint, json=payload, timeout=self.timeout_seconds)
-            try:
-                data = resp.json()
-            except ValueError:
-                data = None
-
-            if not isinstance(data, dict):
-                time.sleep(1)
-                continue
-
-            status = (
-                data.get("result", {}).get("value", [None])[0]
-                if isinstance(data.get("result"), dict)
-                else None
+        if extra_headers:
+            headers.update(dict(extra_headers))
+        try:
+            return self.session.post(
+                self.endpoint,
+                json={"text": text},
+                headers=headers,
+                timeout=self.timeout_seconds,
             )
-            if status:
-                if status.get("err") is not None:
-                    raise SDKError(f"Payment signature failed on-chain: {status.get('err')}")
+        except requests.RequestException as exc:
+            raise SDKError(f"Request to {self.endpoint} failed: {exc}") from exc
 
-                conf = (status.get("confirmationStatus") or "").lower()
-                if conf in {"confirmed", "finalized"}:
-                    return
+    def _validate_payment_required(
+        self, payment_required: dict[str, Any]
+    ) -> ChallengeMetadata:
+        if payment_required.get("x402Version") != 2:
+            raise ProtocolError("Payment challenge must use x402Version 2.")
 
-                # Older nodes may expose finalized via confirmations == 0.
-                confirmations = status.get("confirmations")
-                if confirmations in {0, "0"}:
-                    return
+        resource = payment_required.get("resource")
+        if not isinstance(resource, dict) or resource.get("url") != self.endpoint:
+            raise ProtocolError(
+                f"Payment resource must be exactly {self.endpoint}."
+            )
 
-            time.sleep(1)
-
-        raise SDKError(
-            f"Timed out waiting for payment confirmation for signature {signature}. "
-            "Transaction may still settle shortly; re-run with a retry if needed."
+        accepts = payment_required.get("accepts")
+        if not isinstance(accepts, list):
+            raise ProtocolError("Payment challenge omitted accepts[].")
+        accepted = next(
+            (
+                item
+                for item in accepts
+                if isinstance(item, dict)
+                and item.get("scheme") == "exact"
+                and item.get("network") == SOLANA_NETWORK
+                and item.get("asset") == USDC_MINT
+                and item.get("payTo") == RECIPIENT_WALLET
+            ),
+            None,
         )
+        if accepted is None:
+            raise ProtocolError(
+                "No option matches exact SVM, Solana mainnet, official USDC, "
+                "and the pinned recipient."
+            )
+        amount = accepted.get("amount")
+        if isinstance(amount, bool) or str(amount) != str(PAYMENT_AMOUNT_ATOMIC):
+            raise ProtocolError(
+                f"Payment amount must be {PAYMENT_AMOUNT_ATOMIC} atomic USDC."
+            )
 
-    def _account_exists(self, account: Pubkey) -> bool:
-        info = self.rpc.get_account_info(account)
-        return bool(info.value)
+        extra = accepted.get("extra")
+        if not isinstance(extra, dict):
+            raise ProtocolError("Accepted payment option omitted extra metadata.")
+        decimals = extra.get("decimals", USDC_DECIMALS)
+        if isinstance(decimals, bool) or str(decimals) != str(USDC_DECIMALS):
+            raise ProtocolError(
+                f"USDC decimals must be {USDC_DECIMALS} when supplied."
+            )
 
-    @staticmethod
-    def _derive_associated_token_address(owner: Pubkey, mint: Pubkey) -> Pubkey:
-        return Pubkey.find_program_address(
-            [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
-            ASSOCIATED_TOKEN_PROGRAM_ID,
-        )[0]
-
-    @staticmethod
-    def _create_associated_token_account_ix(
-        payer: Pubkey,
-        owner: Pubkey,
-        mint: Pubkey,
-        account: Pubkey,
-    ) -> Instruction:
-        # SPL Associated Token Program: CreateAssociatedTokenAccount
-        return Instruction(
-            program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-            data=b"\x00",
-            accounts=[
-                AccountMeta(payer, is_signer=True, is_writable=True),
-                AccountMeta(account, is_signer=False, is_writable=True),
-                AccountMeta(owner, is_signer=False, is_writable=False),
-                AccountMeta(mint, is_signer=False, is_writable=False),
-                AccountMeta(SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(SYSVAR_RENT_PUBKEY, is_signer=False, is_writable=False),
-            ],
-        )
-
-    @staticmethod
-    def _transfer_ata_ix(
-        source_ata: Pubkey,
-        destination_ata: Pubkey,
-        owner: Pubkey,
-        atomic_amount: int,
-    ) -> Instruction:
-        if atomic_amount <= 0:
-            raise SDKError(f"Invalid USDC transfer amount: {atomic_amount}")
-
-        # SPL Token Transfer instruction index: 3
-        transfer_payload = bytes([3]) + int(atomic_amount).to_bytes(8, byteorder="little", signed=False)
-        return Instruction(
-            program_id=TOKEN_PROGRAM_ID,
-            data=transfer_payload,
-            accounts=[
-                AccountMeta(source_ata, is_signer=False, is_writable=True),
-                AccountMeta(destination_ata, is_signer=False, is_writable=True),
-                AccountMeta(owner, is_signer=True, is_writable=False),
-            ],
-        )
-
-    @staticmethod
-    def _encode_payment_payload(metadata: Dict[str, Any]) -> str:
-        raw = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
-        return base64.b64encode(raw.encode("utf-8")).decode("ascii")
-
-    @staticmethod
-    def _decode_challenge(challenge_header: str) -> Dict[str, Any]:
-        def attempt(raw: str) -> Optional[Dict[str, Any]]:
-            try:
-                return json.loads(raw)
-            except Exception:
-                pass
-
-            try:
-                decoded = base64.b64decode(raw, validate=True)
-                decoded_str = decoded.decode("utf-8")
-                return json.loads(decoded_str)
-            except Exception:
-                return None
-
-        # direct JSON
-        parsed = attempt(challenge_header)
-        if parsed:
-            return parsed
-
-        # most challenge strings are sent as base64,<payload> / Bearer <payload>
-        for split_token in (",", " "):
-            if split_token not in challenge_header:
-                continue
-            parts = challenge_header.rsplit(split_token, 1)
-            if len(parts) == 2:
-                candidate = parts[1].strip()
-                parsed = attempt(candidate)
-                if parsed:
-                    return parsed
-
-        return {}
-
-    @staticmethod
-    def _extract_challenge_metadata(challenge: Dict[str, Any]) -> ChallengeMetadata:
-        recipient = challenge.get("recipient") or challenge.get("payTo") or RECIPIENT_WALLET
-
-        mint = challenge.get("asset_contract") or challenge.get("mint") or SERVICE_ASSET
-
-        amount_raw = challenge.get("amount", str(PAYMENT_AMOUNT_USDC))
-        amount_atoms = parse_amount_atomic(amount_raw, challenge.get("asset_decimals", USDC_DECIMALS))
+        fee_payer = extra.get("feePayer")
+        memo = extra.get("memo")
+        challenge_id = extra.get("challengeId") or extra.get("challenge_id")
+        if not isinstance(fee_payer, str) or not fee_payer.strip():
+            raise ProtocolError("Accepted terms omitted extra.feePayer.")
+        if not isinstance(memo, str) or not memo.strip():
+            raise ProtocolError("Accepted terms omitted extra.memo.")
+        if len(memo.encode("utf-8")) > 256:
+            raise ProtocolError("Payment memo exceeds 256 bytes.")
+        if not isinstance(challenge_id, str) or not challenge_id.strip():
+            raise ProtocolError("Accepted terms omitted the challenge identifier.")
 
         return ChallengeMetadata(
-            recipient=recipient,
-            amount=amount_atoms,
-            mint=mint,
-            network=challenge.get("network", SOLANA_NETWORK),
-            asset_contract=mint,
+            resource=resource,
+            accepted=accepted,
+            fee_payer=fee_payer.strip(),
+            memo=memo,
+            challenge_id=challenge_id.strip(),
         )
 
-    @staticmethod
-    def _first_non_empty_header(response_headers: Any, *header_names: str) -> str:
-        for name in header_names:
-            value = response_headers.get(name)
-            if value:
-                return value
-            value = response_headers.get(name.lower())
-            if value:
-                return value
-        return ""
+    def _validate_payment_payload(
+        self,
+        headers: Mapping[str, str],
+        metadata: ChallengeMetadata,
+    ) -> None:
+        encoded = self._mapping_header(headers, PAYMENT_SIGNATURE_HEADER)
+        if not encoded:
+            raise ProtocolError("x402 client did not produce PAYMENT-SIGNATURE.")
+        envelope = self._decode_base64_json(encoded, PAYMENT_SIGNATURE_HEADER)
+        if envelope.get("x402Version") != 2:
+            raise ProtocolError("Generated payment payload is not x402 v2.")
+
+        resource = envelope.get("resource")
+        if not isinstance(resource, dict) or resource.get("url") != self.endpoint:
+            raise ProtocolError("Generated payment payload changed the resource.")
+        generated_terms = envelope.get("accepted")
+        if not isinstance(generated_terms, dict):
+            raise ProtocolError("Generated payment payload omitted accepted terms.")
+        for field in ("scheme", "network", "amount", "asset", "payTo"):
+            if generated_terms.get(field) != metadata.accepted.get(field):
+                raise ProtocolError(
+                    f"Generated payment payload changed accepted.{field}."
+                )
+        generated_extra = generated_terms.get("extra")
+        expected_extra = metadata.accepted.get("extra")
+        if not isinstance(generated_extra, dict) or not isinstance(
+            expected_extra, dict
+        ):
+            raise ProtocolError("Generated payload omitted accepted.extra.")
+        for field in ("feePayer", "memo", "decimals"):
+            if generated_extra.get(field) != expected_extra.get(field):
+                raise ProtocolError(
+                    f"Generated payment payload changed accepted.extra.{field}."
+                )
+
+        payload = envelope.get("payload")
+        transaction = payload.get("transaction") if isinstance(payload, dict) else None
+        if not isinstance(transaction, str) or not transaction:
+            raise ProtocolError(
+                "Generated payload omitted its signed partial SVM transaction."
+            )
+        try:
+            base64.b64decode(transaction, validate=True)
+        except Exception as exc:
+            raise ProtocolError(
+                "Generated SVM transaction is not valid base64."
+            ) from exc
 
     @staticmethod
-    def _parse_json_payload(response: Response, *, require_payment: bool = False) -> Dict[str, Any]:
+    def _mapping_header(
+        headers: Mapping[str, str], name: str
+    ) -> str | None:
+        lowered = name.lower()
+        for key, value in headers.items():
+            if key.lower() == lowered:
+                return value
+        return None
+
+    @staticmethod
+    def _decode_base64_json(value: str, name: str) -> dict[str, Any]:
+        try:
+            padded = value + ("=" * (-len(value) % 4))
+            parsed = json.loads(base64.b64decode(padded).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProtocolError(f"{name} is not valid base64 JSON.") from exc
+        if not isinstance(parsed, dict):
+            raise ProtocolError(f"{name} must decode to a JSON object.")
+        return parsed
+
+    @staticmethod
+    def _parse_json_object(response: Response, label: str) -> dict[str, Any]:
         try:
             payload = response.json()
-        except ValueError:
-            raise SDKError(f"Response was not JSON: {response.text[:300]}")
-
-        if require_payment and not isinstance(payload, dict):
-            raise SDKError("Unexpected response shape while expecting payment metadata")
-
+        except ValueError as exc:
+            raise ProtocolError(f"{label} is not JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ProtocolError(f"{label} must be a JSON object.")
         return payload
 
     @staticmethod
     def _raise_http_error(response: Response, context: str) -> None:
         try:
+            details: Any = response.json()
+        except ValueError:
             details = response.text[:500]
-        except Exception:
-            details = "<no response body>"
         raise SDKError(
-            f"{context}. HTTP {response.status_code} from {response.url}. Body: {details}"
+            f"{context}. HTTP {response.status_code} from {response.url}. "
+            f"Body: {details}"
         )
 
     @staticmethod
     def _load_keypair(keypair_path: str) -> Keypair:
         path = Path(keypair_path).expanduser()
-        if not path.exists():
+        if not path.is_file():
             raise SDKError(f"Could not locate keypair path: {path}")
-
         raw = path.read_text(encoding="utf-8").strip()
         if not raw:
             raise SDKError(f"Keypair file is empty: {path}")
+        try:
+            parsed: Any = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = raw
+        return X402ClientSDK._coerce_keypair(parsed)
 
-        data = json.loads(raw)
-
-        if isinstance(data, dict):
-            secret = data.get("secret_key") or data.get("private_key") or data.get("secret")
-            if not secret:
-                raise SDKError(
-                    "Keypair dict format not supported. Expected array[64] or encoded secret string."
-                )
-            if isinstance(secret, str):
-                secret_bytes = b58decode(secret)
-            else:
-                secret_bytes = bytes(secret)
-        elif isinstance(data, list):
-            secret_bytes = bytes(data)
-        elif isinstance(data, str):
-            secret_bytes = b58decode(data)
+    @staticmethod
+    def _coerce_keypair(wallet_key: Any) -> Keypair:
+        if isinstance(wallet_key, Keypair):
+            return wallet_key
+        if isinstance(wallet_key, dict):
+            wallet_key = (
+                wallet_key.get("secretKey")
+                or wallet_key.get("secret_key")
+                or wallet_key.get("private_key")
+                or wallet_key.get("secret")
+            )
+        if isinstance(wallet_key, str):
+            candidate = Path(wallet_key).expanduser()
+            if candidate.is_file():
+                return X402ClientSDK._load_keypair(str(candidate))
+            try:
+                parsed = json.loads(wallet_key)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, (list, dict)):
+                return X402ClientSDK._coerce_keypair(parsed)
+            try:
+                secret_bytes = b58decode(wallet_key)
+            except Exception as exc:
+                raise SDKError("Wallet key is not valid base58.") from exc
+        elif isinstance(wallet_key, (list, tuple, bytes, bytearray)):
+            secret_bytes = bytes(wallet_key)
         else:
-            raise SDKError("Unsupported keypair format.")
+            raise SDKError("Unsupported wallet_key format.")
 
         if len(secret_bytes) == 32:
             return Keypair.from_seed(secret_bytes)
-        if len(secret_bytes) != 64:
-            raise SDKError(
-                f"Unsupported secret key length ({len(secret_bytes)}). Expect 32 or 64 bytes."
-            )
-        return Keypair.from_bytes(secret_bytes)
-
-
-def parse_amount_atomic(amount_raw: Any, decimals: int = USDC_DECIMALS) -> int:
-    """Accept decimal UI strings like "0.002" and integers, returning atomic units."""
-    try:
-        amount = Decimal(str(amount_raw))
-    except Exception as exc:
-        raise SDKError(f"Unable to parse amount '{amount_raw}': {exc}")
-
-    if amount == 0:
-        raise SDKError("Amount must be greater than 0")
-
-    amount = amount.quantize(Decimal("1") if amount % 1 == 0 else Decimal("1.000000"), rounding=ROUND_HALF_UP)
-
-    # If it looks like an on-chain integer atom value, use it directly.
-    if amount.as_tuple().exponent == 0 and amount > Decimal("1"):
-        return int(amount)
-
-    precision = int(decimals)
-    scale = Decimal(10) ** precision
-    return int((amount * scale).to_integral_value(rounding=ROUND_HALF_UP))
+        if len(secret_bytes) == 64:
+            return Keypair.from_bytes(secret_bytes)
+        raise SDKError(
+            f"Unsupported secret key length ({len(secret_bytes)}); expected 32 or 64."
+        )
 
 
 def build_cli() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="x402 Solana text cleanup SDK wrapper")
+    parser = argparse.ArgumentParser(
+        description="Canonical x402 v2 exact-SVM text cleanup client"
+    )
     parser.add_argument("--text", required=True, help="Raw text to clean")
     parser.add_argument(
         "--text-to-clean",
         dest="text_to_clean",
         help="Backward-compatible alias for --text",
     )
-    parser.add_argument(
-        "--endpoint",
-        default=SERVICE_ENDPOINT,
-        help="Service endpoint URL (defaults to /v1/clean)",
-    )
-    parser.add_argument(
-        "--rpc-url",
-        default=MAINNET_RPC,
-        help="Solana JSON RPC endpoint",
-    )
-    parser.add_argument(
-        "--keypair",
-        default=None,
-        help="Optional path to a Solana keypair JSON file",
-    )
+    parser.add_argument("--endpoint", default=SERVICE_ENDPOINT)
+    parser.add_argument("--rpc-url", default=MAINNET_RPC)
+    parser.add_argument("--keypair", "--keypair-path", dest="keypair")
     parser.add_argument(
         "--no-wait",
         action="store_true",
-        help="Submit payment and immediately request unlock without waiting for RPC confirmation",
+        help="Compatibility flag; facilitator settlement remains synchronous",
     )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=30,
-        help="HTTP/RPC timeout in seconds",
-    )
+    parser.add_argument("--timeout", type=float, default=30)
     return parser
 
 
 def main() -> None:
     args = build_cli().parse_args()
     text = args.text_to_clean or args.text
-
-    client = X402ClientSDK(endpoint=args.endpoint, rpc_url=args.rpc_url, timeout_seconds=args.timeout)
+    client = X402ClientSDK(
+        endpoint=args.endpoint,
+        rpc_url=args.rpc_url,
+        timeout_seconds=args.timeout,
+    )
     try:
         result = client.clean_text(
             text=text,
@@ -507,7 +467,6 @@ def main() -> None:
     except SDKError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
-
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
