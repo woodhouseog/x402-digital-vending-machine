@@ -13,11 +13,23 @@ python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-m
 
 This repository does not claim a PyPI publication or an MCP registry listing.
 
-## One evaluation
+## Try one real payment
+
+No signup or API key is required. This example makes one real Schema Gate
+purchase on Solana mainnet. Before running it, use Python 3.10 or newer and a
+locally controlled Solana keypair whose wallet holds at least `0.010 USDC`.
+Keep the keypair, private key, and seed phrase local; never paste them into a
+request, website console, chat, or source repository.
+
+A completed `ACCEPT` or `REJECT` evaluation charges exactly `0.010 USDC`.
+Malformed preflight and payment failures do not settle.
 
 ```python
+from uuid import uuid4
+
 from x402_cleanup import schema_gate
 
+purchase_id = uuid4().hex
 criteria = {
     "canonical_json": True,
     "required_fields": ["/sku", "/quantity"],
@@ -27,8 +39,8 @@ criteria = {
 }
 
 decision = schema_gate(
-    order_id="order-1042",
-    idempotency_key="order-1042-v1",
+    order_id=f"schema-{purchase_id}",
+    idempotency_key=f"schema-{purchase_id}-v1",
     input={"sku": "A-7", "quantity": 2},
     target_schema={
         "type": "object",

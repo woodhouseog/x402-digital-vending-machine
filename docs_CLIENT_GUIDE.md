@@ -6,10 +6,24 @@ Install the public package directly from its GitHub repository:
 python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-machine.git"
 ```
 
+## Try one real payment
+
+No signup or API key is required. This is a production Solana mainnet purchase,
+not a sandbox call. Use Python 3.10 or newer and a locally controlled Solana
+keypair whose wallet holds at least `0.010 USDC`. A completed `ACCEPT` or
+`REJECT` evaluation charges exactly `0.010 USDC`; malformed preflight and
+payment failures do not settle.
+
+Keep the keypair, private key, and seed phrase local. Never paste wallet
+secrets into a request, website console, chat, or source repository.
+
 ```python
+from uuid import uuid4
+
 from x402_cleanup import X402ClientSDK
 
 client = X402ClientSDK(timeout_seconds=30)
+purchase_id = uuid4().hex
 criteria = {
     "canonical_json": True,
     "required_fields": ["/sku", "/quantity"],
@@ -20,8 +34,8 @@ criteria = {
 
 try:
     decision = client.schema_gate(
-        order_id="order-1042",
-        idempotency_key="order-1042-v1",
+        order_id=f"schema-{purchase_id}",
+        idempotency_key=f"schema-{purchase_id}-v1",
         input={"sku": "A-7", "quantity": 2},
         target_schema={
             "type": "object",

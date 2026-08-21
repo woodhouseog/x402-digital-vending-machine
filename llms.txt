@@ -17,6 +17,8 @@ Protocol: x402 v2 exact on solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
 Asset: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 Recipient: E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD
 
+Try one real payment: no signup or API key is required. Use Python 3.10 or newer, install the public SDK from GitHub, and supply a locally controlled Solana-mainnet keypair whose wallet holds at least 0.010 USDC. Generate one UUID and derive a unique order_id and idempotency_key from it for the purchase. A completed ACCEPT or REJECT is a real 0.010 USDC charge. Keep the keypair, private key, and seed phrase local; never place wallet secrets in requests, website fields, chats, or source repositories.
+
 Send an unpaid request to receive PAYMENT-REQUIRED. Submit the canonical base64 x402 v2 PaymentPayload in PAYMENT-SIGNATURE. A wallet address or raw transaction hash is not proof. A completed call returns PAYMENT-RESPONSE plus a signed receipt.
 
 Discovery: https://www.x402digitalvendingmachine.store/.well-known/x402.json
