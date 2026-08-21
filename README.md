@@ -1,31 +1,32 @@
-# x402 Digital Vending Machine: Schema Gate
+# x402 Schema Gate
 
-Schema Gate gives an automated buyer a signed, deterministic verdict on whether
-JSON satisfies a declared schema and acceptance policy. A completed `ACCEPT` or
-`REJECT` evaluation costs `0.010 USDC` (`10000` atomic units). Malformed
-preflight requests, payment failures, and provider failures do not settle. An
-exact retry with the same `idempotency_key` recovers the original receipt and
-does not create a second charge. Every new task is a new paid use; installing
-or integrating the SDK is free.
+Schema Gate is a pay-per-use JSON acceptance service for agents and automated
+workflows. A buyer submits JSON, a bounded target schema, and an explicit
+five-field acceptance policy. The service returns a signed `ACCEPT` or `REJECT`
+receipt after one exact x402 v2 Solana USDC settlement.
 
-- Storefront: <https://www.x402digitalvendingmachine.store/>
-- Schema Gate: `POST https://www.x402digitalvendingmachine.store/v1/schema-gate`
-- Network: Solana mainnet
-- Protocol: x402 v2, `exact` scheme
-
-## Python integration
-
-Install directly from the public source repository (no PyPI publication is
-claimed):
+## Install from GitHub
 
 ```bash
 python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-machine.git"
 ```
 
+This repository does not claim a PyPI publication or an MCP registry listing.
+
+## One evaluation
+
 ```python
 from x402_cleanup import schema_gate
 
-result = schema_gate(
+criteria = {
+    "canonical_json": True,
+    "required_fields": ["/sku", "/quantity"],
+    "forbidden_patterns": ["<script"],
+    "max_output_bytes": 4096,
+    "normalizer_version": "schema-gate-c14n-v1",
+}
+
+decision = schema_gate(
     order_id="order-1042",
     idempotency_key="order-1042-v1",
     input={"sku": "A-7", "quantity": 2},
@@ -36,105 +37,68 @@ result = schema_gate(
             "sku": {"type": "string"},
             "quantity": {"type": "integer", "minimum": 1},
         },
+        "additionalProperties": False,
     },
-    acceptance_criteria={"quantity_limit": 10},
-    wallet_key=agent_key,
+    acceptance_criteria=criteria,
+    keypair_path="~/.config/solana/id.json",
 )
 
-print(result["verdict"])
-if result["verdict"] == "ACCEPT":
-    print(result["output"])
-print(result.get("receipt"), result.get("checks"))
+assert decision["receipt_verified"] is True
+if decision["verdict"] == "ACCEPT":
+    use_result = decision["output"]
 ```
 
-The client canonicalizes `acceptance_criteria` with sorted compact JSON and
-sends `acceptance_commitment = sha256:<hex>`. It probes without wallet use,
-validates the returned resource, Solana network, USDC mint, recipient, and
-dynamic price, then signs through the standard x402 v2 exact-SVM library only
-after a valid HTTP `402`. `max_amount_atomic` defaults to the published `10000`
-atomic-unit ceiling.
+The SDK canonicalizes the policy and sends its lowercase SHA-256 commitment.
+For the policy above, the canonical commitment is:
 
-## Schema Gate request contract
-
-Required JSON keys are `order_id`, `idempotency_key`, `input`, `target_schema`,
-`acceptance_criteria`, and `acceptance_commitment`. `expires_at` is optional.
-Use a new idempotency key for each new evaluation. Reuse a key only to recover
-the exact same request.
-
-The response uses `verdict`, optional structured `checks`, and a signed
-`receipt`. `output` is present only for `ACCEPT`. `recovery` identifies an
-idempotent replay when supplied. Both `ACCEPT` and `REJECT` are completed paid
-verdicts; malformed/provider failures are not verdicts and remain unsettled.
-
-## Legacy text cleanup
-
-Clean noisy text before it reaches an agent's context window. The service
-collapses repeated whitespace and returns compact structured JSON for a flat
-`0.002 USDC` per call, with no account or API key.
-
-- Storefront: <https://www.x402digitalvendingmachine.store/>
-- Paid endpoint: `POST https://www.x402digitalvendingmachine.store/v1/clean`
-- Price: `2000` atomic units (`0.002 USDC`)
-- Network: Solana mainnet
-- Protocol: x402 v2, `exact` scheme
-
-### Legacy Python integration
-
-Install the client directly from this repository:
-
-```bash
-python -m pip install "git+https://github.com/woodhouseog/x402-digital-vending-machine.git"
+```text
+sha256:f3f8f6ac94fdc2d4eac59f404f26c1eb6cadb63a2625cd6642a0a7a2240b1c63
 ```
+
+## Exact billing contract
+
+- Endpoint: `POST https://www.x402digitalvendingmachine.store/v1/schema-gate`
+- Price: exactly `10000` atomic USDC (`0.010 USDC`)
+- Paid outcomes: completed signed `ACCEPT` and `REJECT` evaluations
+- Free outcomes: malformed preflight, payment failure, provider failure
+- Recovery: an exact retry or recovery-token lookup never creates a second charge
+- Recurrence: each distinct task is a new paid evaluation; SDK integration is free
+
+The SDK makes the unsigned preflight first and loads wallet material only after
+it validates the pinned x402 resource, network, mint, recipient, and exact
+price. It sends one paid request and does not automatically repeat a monetary
+request after an ambiguous transport failure.
+
+## Receipt verification and recovery
+
+The SDK verifies the returned ES256 receipt using the service's published JWK:
+
+<https://www.x402digitalvendingmachine.store/.well-known/receipt-key.json>
+
+Verification covers the protected `alg`, `kid`, and receipt type plus the exact
+order, idempotency hash, request hash, acceptance commitment, canonical input
+and schema hashes, verdict, output hash, checks, recovery terms, and settlement
+evidence. `output` is present only for `ACCEPT`.
+
+The server supplies a recovery URL and `sg_` token in the initial 402. They are
+exposed as `client.last_recovery`, `SDKError.recovery`, and the final response's
+`recovery` object. An explicit token recovery is also available:
 
 ```python
-from x402_cleanup import clean_text
+from x402_cleanup import recover_schema_gate
 
-result = clean_text(
-    "Messy   unstructured\n\ntext",
-    wallet_key=agent_key,
+recovered = recover_schema_gate(
+    order_id="order-1042",
+    recovery_token="sg_SERVER_ISSUED_TOKEN",
+    idempotency_key="order-1042-v1",
+    input={"sku": "A-7", "quantity": 2},
+    target_schema={...},
+    acceptance_criteria=criteria,
 )
-print(result["cleaned_text"])
 ```
 
-The wrapper requests the 402 challenge, validates the exact terms, signs the
-canonical Solana payment payload with the buyer wallet, resubmits the request,
-and returns the service result with its settlement receipt.
-
-### Legacy buyer contract
-
-| Field | Required value |
-| --- | --- |
-| Resource | `https://www.x402digitalvendingmachine.store/v1/clean` |
-| Method | `POST` |
-| Request JSON | `{"text":"Text to normalize"}` |
-| x402 version | `2` |
-| Scheme | `exact` |
-| Network | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` |
-| Asset | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` |
-| Amount | `2000` atomic units |
-| Recipient | `E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD` |
-
-An unpaid request returns HTTP `402` with a base64-encoded x402 v2
-`PaymentRequired` object in `PAYMENT-REQUIRED`. Retry the same request with a
-base64-encoded canonical `PaymentPayload` in `PAYMENT-SIGNATURE`. A wallet
-address or raw transaction hash is not a valid payment payload.
-
-A successful paid request returns HTTP `200`, a base64-encoded
-`SettlementResponse` in `PAYMENT-RESPONSE`, and JSON shaped like:
-
-```json
-{
-  "cleaned_text": "Messy unstructured text",
-  "endpoint": "/v1/clean",
-  "payment": {
-    "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-    "amount": "2000",
-    "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-  }
-}
-```
-
-No normalized output is returned until payment is accepted and settled.
+Original request material is required for recovery so the SDK can bind and
+verify the signed receipt rather than trusting an order ID alone.
 
 ## Discovery
 
@@ -144,11 +108,11 @@ No normalized output is returned until payment is accepted and settled.
 - MCP descriptor: [`mcp-x402-server-definition.json`](mcp-x402-server-definition.json)
 - Client guide: [`docs_CLIENT_GUIDE.md`](docs_CLIENT_GUIDE.md)
 
-`mcp-x402-server-definition.json` is a portable descriptor only. This project
-does not claim that an MCP directory has registered or endorsed the service.
+## Legacy compatibility
 
-## Wallet safety
+`clean_text(...)` remains importable for existing clients at its separate
+legacy endpoint and price of `0.002 USDC` (`2000` atomic). It is not the Schema
+Gate product and is intentionally excluded from primary discovery metadata.
 
-Keep wallet secrets local. Never place a seed phrase or private key in source
-control, browser code, a discovery document, or an HTTP request body. The
-client also avoids automatic paid retries after ambiguous network failures.
+Keep wallet secrets local. Never put a seed phrase or private key in source
+control, discovery documents, browser code, or request bodies.

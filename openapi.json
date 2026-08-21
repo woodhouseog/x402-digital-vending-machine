@@ -1,14 +1,12 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "x402 Digital Vending Machine",
-    "version": "3.0.0",
-    "description": "Signed JSON Schema Gate verdicts plus legacy text normalization, protected by canonical x402 v2 exact Solana USDC payment."
+    "title": "x402 Schema Gate",
+    "version": "3.1.0",
+    "description": "Paid deterministic JSON acceptance evaluations with ES256 signed receipts and token recovery over canonical x402 v2 exact Solana USDC."
   },
   "servers": [
-    {
-      "url": "https://www.x402digitalvendingmachine.store"
-    }
+    { "url": "https://www.x402digitalvendingmachine.store" }
   ],
   "paths": {
     "/v1/schema-gate": {
@@ -20,7 +18,7 @@
             "name": "PAYMENT-SIGNATURE",
             "in": "header",
             "required": false,
-            "description": "Base64-encoded canonical x402 v2 PaymentPayload.",
+            "description": "Base64-encoded canonical x402 v2 PaymentPayload. Omit for the unsigned preflight.",
             "schema": { "type": "string", "contentEncoding": "base64" }
           }
         ],
@@ -28,7 +26,29 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/SchemaGateRequest" }
+              "schema": { "$ref": "#/components/schemas/SchemaGateRequest" },
+              "example": {
+                "order_id": "order-1042",
+                "idempotency_key": "order-1042-v1",
+                "input": { "sku": "A-7", "quantity": 2 },
+                "target_schema": {
+                  "type": "object",
+                  "required": ["sku", "quantity"],
+                  "properties": {
+                    "sku": { "type": "string" },
+                    "quantity": { "type": "integer", "minimum": 1 }
+                  },
+                  "additionalProperties": false
+                },
+                "acceptance_criteria": {
+                  "canonical_json": true,
+                  "required_fields": ["/sku", "/quantity"],
+                  "forbidden_patterns": ["<script"],
+                  "max_output_bytes": 4096,
+                  "normalizer_version": "schema-gate-c14n-v1"
+                },
+                "acceptance_commitment": "sha256:f3f8f6ac94fdc2d4eac59f404f26c1eb6cadb63a2625cd6642a0a7a2240b1c63"
+              }
             }
           }
         },
@@ -37,7 +57,7 @@
             "description": "Completed paid ACCEPT/REJECT verdict, or exact idempotent recovery without a second charge.",
             "headers": {
               "PAYMENT-RESPONSE": {
-                "description": "Present for a newly settled evaluation; base64 x402 v2 SettlementResponse.",
+                "description": "Base64 x402 v2 SettlementResponse for the settled evaluation.",
                 "schema": { "type": "string", "contentEncoding": "base64" }
               }
             },
@@ -53,14 +73,14 @@
             "headers": {
               "PAYMENT-REQUIRED": {
                 "required": true,
-                "description": "Base64-encoded x402 v2 PaymentRequired object.",
+                "description": "Base64-encoded x402 v2 PaymentRequired object, including recovery URL and token.",
                 "schema": { "type": "string", "contentEncoding": "base64" }
               }
             }
           },
-          "409": { "description": "Idempotency key reused with different request material; no new settlement." },
-          "422": { "description": "Request cannot be evaluated; no settlement." },
-          "503": { "description": "Provider unavailable; no settlement." }
+          "409": { "description": "Order or idempotency key conflicts with different request material; no settlement." },
+          "422": { "description": "Request cannot be evaluated before settlement." },
+          "503": { "description": "Payment/provider/delivery temporarily unavailable." }
         },
         "x-x402": {
           "x402Version": 2,
@@ -69,118 +89,127 @@
           "amount": "10000",
           "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
           "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
-          "billing": "one charge per completed ACCEPT or REJECT; exact recovery is free"
+          "maxTimeoutSeconds": 600,
+          "billing": "ACCEPT and REJECT are paid; exact retry/recovery has no second charge"
         }
       }
     },
-    "/v1/clean": {
-      "post": {
-        "operationId": "cleanText",
-        "summary": "Normalize text after payment settlement",
+    "/v1/orders/{order_id}": {
+      "get": {
+        "operationId": "recoverSchemaGateOrder",
+        "summary": "Recover an order by server-issued token without initiating payment",
         "parameters": [
           {
-            "name": "PAYMENT-SIGNATURE",
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/OrderId" }
+          },
+          {
+            "name": "Authorization",
             "in": "header",
-            "required": false,
-            "description": "Base64-encoded canonical x402 v2 PaymentPayload.",
-            "schema": {
-              "type": "string",
-              "contentEncoding": "base64"
-            }
+            "required": true,
+            "description": "Bearer followed by the server-issued sg_ recovery token.",
+            "schema": { "type": "string", "pattern": "^Bearer sg_.+$" }
           }
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "text": {
-                    "type": "string",
-                    "minLength": 1
-                  }
-                },
-                "required": ["text"],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
         "responses": {
           "200": {
-            "description": "Payment settled and normalized output delivered.",
-            "headers": {
-              "PAYMENT-RESPONSE": {
-                "description": "Base64-encoded x402 v2 SettlementResponse.",
-                "schema": {
-                  "type": "string",
-                  "contentEncoding": "base64"
-                }
-              }
-            },
+            "description": "Delivered signed verdict recovered without another charge.",
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CleanResponse"
-                }
+                "schema": { "$ref": "#/components/schemas/SchemaGateResponse" }
               }
             }
           },
-          "400": {
-            "description": "Malformed JSON or invalid text input."
-          },
-          "402": {
-            "description": "Payment is required or the supplied payment was rejected.",
-            "headers": {
-              "PAYMENT-REQUIRED": {
-                "description": "Base64-encoded x402 v2 PaymentRequired object.",
-                "required": true,
-                "schema": {
-                  "type": "string",
-                  "contentEncoding": "base64"
-                }
+          "202": {
+            "description": "Order is processing or paid delivery is pending.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RecoveryStatus" }
               }
             }
           },
-          "409": {
-            "description": "The payment payload cannot be reused for a different request."
+          "401": { "description": "Recovery token is missing or invalid." },
+          "404": { "description": "Order does not exist." },
+          "410": { "description": "Order recovery has expired." }
+        }
+      }
+    },
+    "/.well-known/receipt-key.json": {
+      "get": {
+        "operationId": "getSchemaGateReceiptKey",
+        "summary": "Fetch the public ES256 receipt verification key",
+        "responses": {
+          "200": {
+            "description": "Public JWK set and receipt metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReceiptKeyDocument" }
+              }
+            }
           },
-          "429": {
-            "description": "Request rate limit exceeded."
-          },
-          "502": {
-            "description": "Payment settlement is temporarily unavailable."
-          }
-        },
-        "x-x402": {
-          "x402Version": 2,
-          "scheme": "exact",
-          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-          "amount": "2000",
-          "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-          "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD"
+          "503": { "description": "Receipt verification key is unavailable." }
         }
       }
     }
   },
   "components": {
     "schemas": {
+      "OrderId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+      },
+      "AcceptanceCriteria": {
+        "type": "object",
+        "properties": {
+          "canonical_json": { "const": true },
+          "required_fields": {
+            "type": "array",
+            "maxItems": 64,
+            "items": { "type": "string", "maxLength": 256, "pattern": "^(|/.*)$" }
+          },
+          "forbidden_patterns": {
+            "type": "array",
+            "maxItems": 32,
+            "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "max_output_bytes": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100000
+          },
+          "normalizer_version": { "const": "schema-gate-c14n-v1" }
+        },
+        "required": [
+          "canonical_json",
+          "required_fields",
+          "forbidden_patterns",
+          "max_output_bytes",
+          "normalizer_version"
+        ],
+        "additionalProperties": false
+      },
       "SchemaGateRequest": {
         "type": "object",
         "properties": {
-          "order_id": { "type": "string", "minLength": 1 },
-          "idempotency_key": { "type": "string", "minLength": 1 },
+          "order_id": { "$ref": "#/components/schemas/OrderId" },
+          "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 128 },
           "input": true,
           "target_schema": { "type": "object" },
-          "acceptance_criteria": {
-            "oneOf": [{ "type": "object" }, { "type": "array" }]
-          },
+          "acceptance_criteria": { "$ref": "#/components/schemas/AcceptanceCriteria" },
           "acceptance_commitment": {
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$"
           },
-          "expires_at": { "type": "string" }
+          "expires_at": {
+            "oneOf": [
+              { "type": "string", "format": "date-time" },
+              { "type": "integer" }
+            ]
+          }
         },
         "required": [
           "order_id",
@@ -192,39 +221,86 @@
         ],
         "additionalProperties": false
       },
+      "Recovery": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "format": "uri" },
+          "token": { "type": "string", "pattern": "^sg_.+$" }
+        },
+        "required": ["url", "token"],
+        "additionalProperties": false
+      },
+      "ReceiptEnvelope": {
+        "type": "object",
+        "properties": {
+          "protected": {
+            "type": "object",
+            "properties": {
+              "alg": { "const": "ES256" },
+              "kid": { "type": "string", "minLength": 1 },
+              "typ": { "const": "x402-schema-gate-receipt" }
+            },
+            "required": ["alg", "kid", "typ"],
+            "additionalProperties": false
+          },
+          "payload": { "type": "object" },
+          "signature": { "type": "string", "contentEncoding": "base64url" }
+        },
+        "required": ["protected", "payload", "signature"],
+        "additionalProperties": false
+      },
       "SchemaGateResponse": {
         "type": "object",
-        "required": ["verdict"],
+        "required": ["order_id", "status", "verdict", "checks", "receipt", "payment", "recovery"],
         "properties": {
+          "order_id": { "$ref": "#/components/schemas/OrderId" },
+          "status": { "const": "delivered" },
           "verdict": { "enum": ["ACCEPT", "REJECT"] },
           "output": { "description": "Present only when verdict is ACCEPT." },
-          "checks": {
-            "oneOf": [{ "type": "object" }, { "type": "array" }]
-          },
-          "receipt": {
-            "oneOf": [{ "type": "object" }, { "type": "string" }]
-          },
-          "recovery": {
-            "oneOf": [{ "type": "object" }, { "type": "boolean" }]
-          }
+          "canonical_json": { "type": "string" },
+          "errors": { "description": "Present for REJECT." },
+          "checks": { "type": "array", "items": { "type": "object" } },
+          "receipt": { "$ref": "#/components/schemas/ReceiptEnvelope" },
+          "payment": { "type": "object" },
+          "delivery": { "type": "object" },
+          "recovery": { "$ref": "#/components/schemas/Recovery" }
         },
         "additionalProperties": true
       },
-      "CleanResponse": {
+      "RecoveryStatus": {
         "type": "object",
-        "required": ["cleaned_text", "endpoint", "payment"],
         "properties": {
-          "cleaned_text": {
-            "type": "string"
+          "order_id": { "$ref": "#/components/schemas/OrderId" },
+          "status": { "enum": ["processing", "paid_delivery_pending"] },
+          "payment_settled": { "type": "boolean" },
+          "recovery": { "$ref": "#/components/schemas/Recovery" }
+        },
+        "required": ["order_id", "status", "recovery"],
+        "additionalProperties": true
+      },
+      "ReceiptKeyDocument": {
+        "type": "object",
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kty": { "const": "EC" },
+                "crv": { "const": "P-256" },
+                "alg": { "const": "ES256" },
+                "use": { "const": "sig" },
+                "kid": { "type": "string" },
+                "x": { "type": "string" },
+                "y": { "type": "string" }
+              },
+              "required": ["kty", "crv", "alg", "use", "kid", "x", "y"]
+            }
           },
-          "endpoint": {
-            "const": "/v1/clean"
-          },
-          "payment": {
-            "type": "object",
-            "additionalProperties": true
-          }
-        }
+          "receipt_type": { "const": "x402-schema-gate-receipt" },
+          "canonicalization": { "const": "schema-gate-c14n-v1" }
+        },
+        "required": ["keys", "receipt_type", "canonicalization"]
       }
     }
   }

@@ -1,37 +1,26 @@
-# x402 Digital Vending Machine
-
-Production Schema Gate for automated JSON acceptance decisions, with legacy
-text normalization retained for compatibility.
+# x402 Schema Gate
 
 Primary endpoint: POST https://www.x402digitalvendingmachine.store/v1/schema-gate
-Required keys: order_id, idempotency_key, input, target_schema,
-acceptance_criteria, acceptance_commitment
-Optional key: expires_at
-Commitment: sha256 of sorted, compact JSON acceptance_criteria
+Purpose: deterministic JSON canonicalization plus a bounded JSON Schema and buyer-committed acceptance evaluation
+Required request keys: order_id, idempotency_key, input, target_schema, acceptance_criteria, acceptance_commitment
+Optional request key: expires_at
+Idempotency key: 8-128 characters
+Acceptance criteria: exactly canonical_json=true, required_fields, forbidden_patterns, max_output_bytes, normalizer_version=schema-gate-c14n-v1
+Commitment: sha256:<lowercase SHA-256 hex of sorted compact JSON acceptance_criteria>
 Verdict: ACCEPT or REJECT; output exists only for ACCEPT
-Price: 0.010 USDC (10000 atomic units) per completed signed evaluation
-Billing: both ACCEPT and REJECT are paid; malformed preflight, payment, and
-provider failures are unsettled; exact idempotent recovery has no second charge
-Usage: every new task is a new paid execution; SDK integration itself is free
-
-Storefront: https://www.x402digitalvendingmachine.store/
-Endpoint: POST https://www.x402digitalvendingmachine.store/v1/clean
-Input: {"text":"Raw   text"}
-Output: structured JSON containing normalized text
-Price: 0.002 USDC (2000 atomic units) per call
-Protocol: x402 v2, exact scheme
-Network: solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
+Price: exactly 0.010 USDC (10000 atomic units) per completed signed evaluation
+Billing: both ACCEPT and REJECT are paid; malformed preflight, payment, and provider failures are unsettled
+Recovery: exact idempotent retry or GET /v1/orders/{order_id} with a server-issued recovery token, no second charge
+Receipt: ES256 envelope verified with https://www.x402digitalvendingmachine.store/.well-known/receipt-key.json
+Usage: each new task is a new paid execution; SDK integration itself is free
+Protocol: x402 v2 exact on solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
 Asset: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 Recipient: E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD
 
-Send an unpaid request to receive PAYMENT-REQUIRED. Submit the canonical
-base64 x402 v2 PaymentPayload in PAYMENT-SIGNATURE. A wallet address or raw
-transaction hash is not valid proof. Settled calls return PAYMENT-RESPONSE and
-the normalized JSON result.
+Send an unpaid request to receive PAYMENT-REQUIRED. Submit the canonical base64 x402 v2 PaymentPayload in PAYMENT-SIGNATURE. A wallet address or raw transaction hash is not proof. A completed call returns PAYMENT-RESPONSE plus a signed receipt.
 
 Discovery: https://www.x402digitalvendingmachine.store/.well-known/x402.json
 OpenAPI: https://www.x402digitalvendingmachine.store/openapi.json
 SDK: https://github.com/woodhouseog/x402-digital-vending-machine
 
-The repository contains a portable MCP descriptor, but no MCP registry listing
-or PyPI publication is claimed.
+The repository contains a portable descriptor only. No PyPI publication, MCP registry acceptance, external demand, or revenue is claimed.
