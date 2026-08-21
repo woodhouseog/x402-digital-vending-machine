@@ -18,6 +18,8 @@ from scripts.x402_client_sdk import (
     SCHEMA_GATE_AMOUNT_ATOMIC,
     SCHEMA_GATE_ENDPOINT,
     SCHEMA_GATE_NORMALIZER,
+    SCHEMA_GATE_RECOVERY_TOKEN_HEADER,
+    SCHEMA_GATE_RECOVERY_URL_HEADER,
     SCHEMA_GATE_RECEIPT_TYPE,
     SOLANA_NETWORK,
     USDC_MINT,
@@ -117,6 +119,24 @@ class AmbiguousExecutionSession:
         raise requests.ConnectionError("ambiguous paid transport failure")
 
 
+class AmbiguousSchemaSession:
+    def __init__(self, challenge, recovery_headers):
+        self.challenge = challenge
+        self.recovery_headers = recovery_headers
+        self.post_calls = []
+
+    def post(self, endpoint, json=None, headers=None, timeout=None):
+        self.post_calls.append((endpoint, json, dict(headers or {}), timeout))
+        if len(self.post_calls) == 1:
+            challenged = response(self.challenge, status=402, url=endpoint)
+            challenged.headers["PAYMENT-REQUIRED"] = base64.b64encode(
+                _canonical_json(self.challenge).encode()
+            ).decode()
+            challenged.headers.update(self.recovery_headers)
+            return challenged
+        raise requests.ConnectionError("ambiguous paid transport failure")
+
+
 class FakeExecutionHTTPClient:
     def __init__(self, challenge):
         self.challenge = challenge
@@ -133,6 +153,34 @@ class FakeExecutionHTTPClient:
         return {
             "PAYMENT-SIGNATURE": base64.b64encode(
                 _canonical_json(envelope).encode()
+            ).decode()
+        }, object()
+
+
+class CapturingSchemaHTTPClient:
+    def __init__(self):
+        self.payment_required = None
+        self.payment_envelope = None
+
+    def handle_402_response(self, headers, _content, _url):
+        encoded = next(
+            value
+            for key, value in headers.items()
+            if key.lower() == "payment-required"
+        )
+        self.payment_required = json.loads(base64.b64decode(encoded))
+        self.payment_envelope = {
+            "x402Version": 2,
+            "resource": self.payment_required["resource"],
+            "accepted": self.payment_required["accepts"][0],
+            "payload": {
+                "transaction": base64.b64encode(b"signed-transaction").decode()
+            },
+            "extensions": self.payment_required.get("extensions"),
+        }
+        return {
+            "PAYMENT-SIGNATURE": base64.b64encode(
+                _canonical_json(self.payment_envelope).encode()
             ).decode()
         }, object()
 
@@ -183,6 +231,123 @@ class SchemaGateSDKTests(unittest.TestCase):
                 challenge,
                 expected_endpoint=SCHEMA_GATE_ENDPOINT,
                 expected_amount=SCHEMA_GATE_AMOUNT_ATOMIC,
+            )
+
+    def test_schema_gate_prefers_headers_and_never_echoes_recovery_bearer(self):
+        order_id = "order-1042"
+        commitment = build_acceptance_commitment(CRITERIA)
+        binding = _schema_gate_binding(
+            order_id=order_id,
+            idempotency_key="order-1042-v1",
+            input_value={"sku": "A-7", "quantity": 2},
+            target_schema={"type": "object"},
+            acceptance_commitment=commitment,
+            expires_at=None,
+        )
+        expected_info = {
+            "orderId": order_id,
+            "requestHash": binding["request_hash"],
+            "acceptanceCommitment": commitment,
+            "recovery": {
+                "url": f"https://www.x402digitalvendingmachine.store/v1/orders/{order_id}",
+                "token": "sg_info-token",
+            },
+        }
+        challenge = {
+            "x402Version": 2,
+            "resource": {"url": SCHEMA_GATE_ENDPOINT},
+            "accepts": [{
+                "scheme": "exact",
+                "network": SOLANA_NETWORK,
+                "amount": str(SCHEMA_GATE_AMOUNT_ATOMIC),
+                "asset": USDC_MINT,
+                "payTo": RECIPIENT_WALLET,
+                "extra": {
+                    "feePayer": "not-the-buyer",
+                    "memo": "memo",
+                    "challengeId": "challenge",
+                    "schemaGateExtensionVersion": "2",
+                },
+            }],
+            "extensions": {"schemaGate": {
+                "info": expected_info,
+                "schema": {"type": "object"},
+                "orderId": "legacy-wrong-order",
+                "requestHash": "legacy-wrong-hash",
+                "acceptanceCommitment": "legacy-wrong-commitment",
+                "recovery": {
+                    "url": f"https://www.x402digitalvendingmachine.store/v1/orders/{order_id}",
+                    "token": "sg_legacy-token",
+                },
+            }},
+        }
+        recovery = {
+            SCHEMA_GATE_RECOVERY_URL_HEADER:
+                f"https://www.x402digitalvendingmachine.store/v1/orders/{order_id}",
+            SCHEMA_GATE_RECOVERY_TOKEN_HEADER: "sg_header-token",
+        }
+        session = AmbiguousSchemaSession(challenge, recovery)
+        fake_http = CapturingSchemaHTTPClient()
+        client = X402ClientSDK(session=session)
+        with (
+            patch("scripts.x402_client_sdk.x402ClientSync", return_value=object()),
+            patch("scripts.x402_client_sdk.register_exact_svm_client"),
+            patch("scripts.x402_client_sdk.KeypairSigner", return_value=object()),
+            patch(
+                "scripts.x402_client_sdk.x402HTTPClientSync",
+                return_value=fake_http,
+            ),
+        ):
+            with self.assertRaises(SDKError) as raised:
+                client.schema_gate(
+                    order_id=order_id,
+                    idempotency_key="order-1042-v1",
+                    input={"sku": "A-7", "quantity": 2},
+                    target_schema={"type": "object"},
+                    acceptance_criteria=CRITERIA,
+                    wallet_key=bytes(range(32)),
+                )
+
+        self.assertEqual(raised.exception.recovery["token"], "sg_header-token")
+        sanitized = fake_http.payment_required["extensions"]["schemaGate"]
+        self.assertNotIn("recovery", sanitized)
+        self.assertNotIn("recovery", sanitized["info"])
+        paid_headers = session.post_calls[1][2]
+        payment_envelope = json.loads(
+            base64.b64decode(paid_headers["PAYMENT-SIGNATURE"])
+        )
+        self.assertNotIn("sg_header-token", _canonical_json(payment_envelope))
+        self.assertNotIn("sg_info-token", _canonical_json(payment_envelope))
+        self.assertNotIn("sg_legacy-token", _canonical_json(payment_envelope))
+
+    def test_schema_gate_recovery_falls_back_to_info_then_legacy(self):
+        order_id = "order-1042"
+        url = f"https://www.x402digitalvendingmachine.store/v1/orders/{order_id}"
+        client = X402ClientSDK(session=KeySession({}))
+        challenge = {
+            "extensions": {"schemaGate": {
+                "info": {"recovery": {"url": url, "token": "sg_info-token"}},
+                "recovery": {"url": url, "token": "sg_legacy-token"},
+            }}
+        }
+        self.assertEqual(
+            client._extract_schema_gate_recovery({}, challenge, order_id=order_id)[
+                "token"
+            ],
+            "sg_info-token",
+        )
+        del challenge["extensions"]["schemaGate"]["info"]["recovery"]
+        self.assertEqual(
+            client._extract_schema_gate_recovery({}, challenge, order_id=order_id)[
+                "token"
+            ],
+            "sg_legacy-token",
+        )
+        with self.assertRaisesRegex(ProtocolError, "supplied together"):
+            client._extract_schema_gate_recovery(
+                {SCHEMA_GATE_RECOVERY_URL_HEADER: url},
+                challenge,
+                order_id=order_id,
             )
 
     def test_explicit_recovery_uses_bearer_token_and_cannot_pay(self):

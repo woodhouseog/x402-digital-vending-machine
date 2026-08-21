@@ -64,6 +64,8 @@ EXECUTION_GATE_OPERATION = "execution-gate-v1"
 USDC_DECIMALS = 6
 PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED"
 PAYMENT_SIGNATURE_HEADER = "PAYMENT-SIGNATURE"
+SCHEMA_GATE_RECOVERY_URL_HEADER = "X-Schema-Gate-Recovery-URL"
+SCHEMA_GATE_RECOVERY_TOKEN_HEADER = "X-Schema-Gate-Recovery-Token"
 
 
 class SDKError(RuntimeError):
@@ -656,16 +658,12 @@ class X402ClientSDK:
                 raise ProtocolError(
                     f"Schema Gate challenge changed extensions.schemaGate.{field}."
                 )
-        recovery = schema_gate_terms.get("recovery")
-        if (
-            not isinstance(recovery, dict)
-            or recovery.get("url")
-            != f"https://www.x402digitalvendingmachine.store/v1/orders/{quote(order_id, safe='')}"
-            or not isinstance(recovery.get("token"), str)
-            or not recovery["token"].startswith("sg_")
-        ):
-            raise ProtocolError("Schema Gate challenge omitted valid recovery terms.")
-        self.last_recovery = dict(recovery)
+        recovery = self._extract_schema_gate_recovery(
+            probe.headers,
+            payment_required,
+            order_id=order_id,
+        )
+        self.last_recovery = recovery
 
         if not keypair_path and wallet_key is None:
             raise SDKError(
@@ -691,8 +689,19 @@ class X402ClientSDK:
             rpc_url=self.rpc_url,
         )
         http_client = x402HTTPClientSync(core_client)
-        response_headers = dict(probe.headers)
-        response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
+        recovery_header_names = {
+            SCHEMA_GATE_RECOVERY_URL_HEADER.lower(),
+            SCHEMA_GATE_RECOVERY_TOKEN_HEADER.lower(),
+        }
+        response_headers = {
+            key: value
+            for key, value in probe.headers.items()
+            if key.lower() not in recovery_header_names
+        }
+        signable_required = self._without_schema_gate_recovery(payment_required)
+        response_headers[PAYMENT_REQUIRED_HEADER] = base64.b64encode(
+            _canonical_json(signable_required).encode("utf-8")
+        ).decode("ascii")
         try:
             payment_headers, payment_payload = http_client.handle_402_response(
                 response_headers,
@@ -713,6 +722,10 @@ class X402ClientSDK:
             payment_headers,
             metadata,
             expected_endpoint=SCHEMA_GATE_ENDPOINT,
+        )
+        self._validate_recovery_not_echoed(
+            payment_headers,
+            recovery_token=recovery["token"],
         )
 
         # A monetary request is sent exactly once. Ambiguous transport failures
@@ -1388,7 +1401,8 @@ class X402ClientSDK:
         if isinstance(extensions, dict):
             candidate = extensions.get("schemaGate")
             if isinstance(candidate, dict):
-                schema_gate = candidate
+                info = candidate.get("info")
+                schema_gate = info if isinstance(info, dict) else candidate
             execution_candidate = extensions.get("executionGate")
             if isinstance(execution_candidate, dict):
                 execution_gate = execution_candidate
@@ -1403,6 +1417,113 @@ class X402ClientSDK:
             schema_gate=schema_gate,
             execution_gate=execution_gate,
         )
+
+    def _extract_schema_gate_recovery(
+        self,
+        headers: Mapping[str, str],
+        payment_required: Mapping[str, Any],
+        *,
+        order_id: str,
+    ) -> dict[str, str]:
+        """Read merchant recovery without making it signable x402 material."""
+        header_url = self._mapping_header(
+            headers, SCHEMA_GATE_RECOVERY_URL_HEADER
+        )
+        header_token = self._mapping_header(
+            headers, SCHEMA_GATE_RECOVERY_TOKEN_HEADER
+        )
+        if header_url is not None or header_token is not None:
+            if not header_url or not header_token:
+                raise ProtocolError(
+                    "Schema Gate recovery headers must be supplied together."
+                )
+            candidate: Any = {"url": header_url, "token": header_token}
+        else:
+            extensions = payment_required.get("extensions")
+            schema_gate = (
+                extensions.get("schemaGate")
+                if isinstance(extensions, Mapping)
+                else None
+            )
+            info = (
+                schema_gate.get("info")
+                if isinstance(schema_gate, Mapping)
+                else None
+            )
+            candidate = (
+                info.get("recovery")
+                if isinstance(info, Mapping)
+                and isinstance(info.get("recovery"), Mapping)
+                else None
+            )
+            if candidate is None and isinstance(schema_gate, Mapping):
+                candidate = schema_gate.get("recovery")
+
+        expected_url = (
+            "https://www.x402digitalvendingmachine.store/v1/orders/"
+            f"{quote(order_id, safe='')}"
+        )
+        if (
+            not isinstance(candidate, Mapping)
+            or candidate.get("url") != expected_url
+            or not isinstance(candidate.get("token"), str)
+            or not candidate["token"].startswith("sg_")
+        ):
+            raise ProtocolError("Schema Gate challenge omitted valid recovery terms.")
+        return {"url": expected_url, "token": candidate["token"]}
+
+    @staticmethod
+    def _without_schema_gate_recovery(
+        payment_required: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Copy a challenge while removing recovery bearers from extensions."""
+        sanitized = json.loads(_canonical_json(payment_required))
+        extensions = sanitized.get("extensions")
+        schema_gate = (
+            extensions.get("schemaGate")
+            if isinstance(extensions, dict)
+            else None
+        )
+        if isinstance(schema_gate, dict):
+            schema_gate.pop("recovery", None)
+            info = schema_gate.get("info")
+            if isinstance(info, dict):
+                info.pop("recovery", None)
+        return sanitized
+
+    def _validate_recovery_not_echoed(
+        self,
+        headers: Mapping[str, str],
+        *,
+        recovery_token: str,
+    ) -> None:
+        encoded = self._mapping_header(headers, PAYMENT_SIGNATURE_HEADER)
+        if not encoded:
+            raise ProtocolError("x402 client did not produce PAYMENT-SIGNATURE.")
+        envelope = self._decode_base64_json(encoded, PAYMENT_SIGNATURE_HEADER)
+        if recovery_token in _canonical_json(envelope):
+            raise ProtocolError(
+                "Generated payment payload exposed the Schema Gate recovery token."
+            )
+        extensions = envelope.get("extensions")
+        schema_gate = (
+            extensions.get("schemaGate")
+            if isinstance(extensions, Mapping)
+            else None
+        )
+        info = (
+            schema_gate.get("info")
+            if isinstance(schema_gate, Mapping)
+            else None
+        )
+        if isinstance(schema_gate, Mapping) and "recovery" in schema_gate:
+            raise ProtocolError(
+                "Generated payment payload exposed Schema Gate recovery metadata."
+            )
+        if isinstance(info, Mapping) and "recovery" in info:
+            raise ProtocolError(
+                "Generated payment payload exposed Schema Gate recovery metadata."
+            )
 
     def _validate_payment_payload(
         self,
