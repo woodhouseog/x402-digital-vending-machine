@@ -12,6 +12,19 @@
   "accepts": [
     {
       "scheme": "exact",
+      "network": "eip155:8453",
+      "amount": "10000",
+      "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "payTo": "0xCbE8df651925485046bFd42b736186433904F8a6",
+      "maxTimeoutSeconds": 300,
+      "extra": {
+        "name": "USD Coin",
+        "version": "2",
+        "assetTransferMethod": "eip3009"
+      }
+    },
+    {
+      "scheme": "exact",
       "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
       "amount": "10000",
       "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",

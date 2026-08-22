@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical x402 v2 exact-SVM client for Schema Gate and legacy cleanup.
+"""Canonical x402 v2 client for Base, Solana, Schema Gate, and cleanup.
 
 The buyer signs only the transfer-authority portion of the transaction. The
 facilitator supplies the fee-payer signature, broadcasts, and settles it. This
@@ -27,10 +27,13 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from eth_account import Account
 from requests import Response, Session
 from solders.keypair import Keypair
 from x402 import x402ClientSync
 from x402.http import x402HTTPClientSync
+from x402.mechanisms.evm import EthAccountSigner
+from x402.mechanisms.evm.exact.register import register_exact_evm_client
 from x402.mechanisms.svm import KeypairSigner
 from x402.mechanisms.svm.exact.register import register_exact_svm_client
 
@@ -50,6 +53,9 @@ EXECUTION_RECEIPT_KEY_ENDPOINT = (
     ".well-known/execution-gate-receipt-jwks.json"
 )
 MAINNET_RPC = "https://api.mainnet-beta.solana.com"
+BASE_NETWORK = "eip155:8453"
+BASE_USDC_ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+BASE_RECIPIENT_WALLET = "0xCbE8df651925485046bFd42b736186433904F8a6"
 SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RECIPIENT_WALLET = "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD"
@@ -93,8 +99,9 @@ class PaymentError(SDKError):
 class ChallengeMetadata:
     resource: dict[str, Any]
     accepted: dict[str, Any]
-    fee_payer: str
-    memo: str
+    rail: str
+    fee_payer: str | None
+    memo: str | None
     challenge_id: str
     amount_atomic: int
     schema_gate: dict[str, Any] | None = None
@@ -446,6 +453,7 @@ class X402ClientSDK:
         wallet_key: Optional[Any] = None,
         verify_signature: bool = True,
         keypair_timeout_seconds: Optional[int] = None,
+        evm_wallet_key: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Buy one cleanup and return structured JSON plus settlement receipt.
 
@@ -459,9 +467,10 @@ class X402ClientSDK:
             raise SDKError("Text input must be a non-empty string.")
         if keypair_path and wallet_key is not None:
             raise SDKError("Provide either wallet_key or keypair_path, not both.")
-        if not keypair_path and wallet_key is None:
+        if not keypair_path and wallet_key is None and evm_wallet_key is None:
             raise SDKError(
-                "Purchase requires wallet_key or a local Solana keypair_path."
+                "Purchase requires evm_wallet_key, wallet_key, or a local "
+                "Solana keypair_path."
             )
 
         probe = self._post_clean(text)
@@ -478,26 +487,16 @@ class X402ClientSDK:
         payment_required = self._decode_base64_json(
             encoded_required, PAYMENT_REQUIRED_HEADER
         )
-        metadata = self._validate_payment_required(payment_required)
-
-        payer = (
-            self._coerce_keypair(wallet_key)
-            if wallet_key is not None
-            else self._load_keypair(keypair_path or "")
+        metadata = self._validate_payment_required(
+            payment_required,
+            prefer_base=evm_wallet_key is not None,
         )
-        if str(payer.pubkey()) == metadata.fee_payer:
-            raise ProtocolError(
-                "Buyer authority cannot also be the facilitator fee payer."
-            )
-
-        core_client = x402ClientSync()
-        register_exact_svm_client(
-            core_client,
-            KeypairSigner(payer),
-            networks=SOLANA_NETWORK,
-            rpc_url=self.rpc_url,
+        http_client, expected_payer = self._payment_client(
+            metadata,
+            wallet_key=wallet_key,
+            keypair_path=keypair_path,
+            evm_wallet_key=evm_wallet_key,
         )
-        http_client = x402HTTPClientSync(core_client)
 
         response_headers = dict(probe.headers)
         response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
@@ -509,11 +508,16 @@ class X402ClientSDK:
             )
         except Exception as exc:
             raise PaymentError(
-                f"Could not create canonical exact-SVM payment payload: {exc}"
+                f"Could not create canonical exact-{metadata.rail.upper()} "
+                f"payment payload: {exc}"
             ) from exc
         if payment_payload is None:
             raise ProtocolError("x402 client did not create a payment payload.")
-        self._validate_payment_payload(payment_headers, metadata)
+        self._validate_payment_payload(
+            payment_headers,
+            metadata,
+            expected_payer=expected_payer,
+        )
 
         # Exactly one paid resubmission. Never automatically replay a monetary
         # request after an ambiguous connection failure.
@@ -568,6 +572,7 @@ class X402ClientSDK:
         keypair_path: Optional[str] = None,
         expires_at: str | int | None = None,
         max_amount_atomic: int = SCHEMA_GATE_AMOUNT_ATOMIC,
+        evm_wallet_key: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Purchase one signed Schema Gate evaluation or recover its receipt.
 
@@ -644,6 +649,7 @@ class X402ClientSDK:
             payment_required,
             expected_endpoint=SCHEMA_GATE_ENDPOINT,
             expected_amount=SCHEMA_GATE_AMOUNT_ATOMIC,
+            prefer_base=evm_wallet_key is not None,
         )
         schema_gate_terms = metadata.schema_gate
         if not schema_gate_terms:
@@ -665,30 +671,18 @@ class X402ClientSDK:
         )
         self.last_recovery = recovery
 
-        if not keypair_path and wallet_key is None:
+        if not keypair_path and wallet_key is None and evm_wallet_key is None:
             raise SDKError(
-                "A new Schema Gate evaluation requires wallet_key or "
-                "a local Solana keypair_path.",
+                "A new Schema Gate evaluation requires evm_wallet_key, "
+                "wallet_key, or a local Solana keypair_path.",
                 recovery=self.last_recovery,
             )
-        payer = (
-            self._coerce_keypair(wallet_key)
-            if wallet_key is not None
-            else self._load_keypair(keypair_path or "")
+        http_client, expected_payer = self._payment_client(
+            metadata,
+            wallet_key=wallet_key,
+            keypair_path=keypair_path,
+            evm_wallet_key=evm_wallet_key,
         )
-        if str(payer.pubkey()) == metadata.fee_payer:
-            raise ProtocolError(
-                "Buyer authority cannot also be the facilitator fee payer."
-            )
-
-        core_client = x402ClientSync()
-        register_exact_svm_client(
-            core_client,
-            KeypairSigner(payer),
-            networks=SOLANA_NETWORK,
-            rpc_url=self.rpc_url,
-        )
-        http_client = x402HTTPClientSync(core_client)
         recovery_header_names = {
             SCHEMA_GATE_RECOVERY_URL_HEADER.lower(),
             SCHEMA_GATE_RECOVERY_TOKEN_HEADER.lower(),
@@ -710,7 +704,8 @@ class X402ClientSDK:
             )
         except Exception as exc:
             raise PaymentError(
-                f"Could not create canonical exact-SVM payment payload: {exc}",
+                f"Could not create canonical exact-{metadata.rail.upper()} "
+                f"payment payload: {exc}",
                 recovery=self.last_recovery,
             ) from exc
         if payment_payload is None:
@@ -722,6 +717,7 @@ class X402ClientSDK:
             payment_headers,
             metadata,
             expected_endpoint=SCHEMA_GATE_ENDPOINT,
+            expected_payer=expected_payer,
         )
         self._validate_recovery_not_echoed(
             payment_headers,
@@ -805,6 +801,7 @@ class X402ClientSDK:
         max_amount_atomic: int,
         wallet_key: Optional[Any] = None,
         keypair_path: Optional[str] = None,
+        evm_wallet_key: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Purchase one private-pilot execution with one paid attempt at most."""
         self._validate_execution_request(
@@ -875,6 +872,7 @@ class X402ClientSDK:
             expected_amount=None,
             max_amount=max_amount_atomic,
             require_amount_string=True,
+            prefer_base=evm_wallet_key is not None,
         )
         binding, recovery = self._validate_execution_challenge(
             metadata=metadata,
@@ -883,29 +881,21 @@ class X402ClientSDK:
         self.last_recovery = recovery
 
         try:
-            if not keypair_path and wallet_key is None:
+            if (
+                not keypair_path
+                and wallet_key is None
+                and evm_wallet_key is None
+            ):
                 raise SDKError(
-                    "A new execution requires wallet_key or a local Solana "
-                    "keypair_path."
+                    "A new execution requires evm_wallet_key, wallet_key, or "
+                    "a local Solana keypair_path."
                 )
-            payer = (
-                self._coerce_keypair(wallet_key)
-                if wallet_key is not None
-                else self._load_keypair(keypair_path or "")
+            http_client, expected_payer = self._payment_client(
+                metadata,
+                wallet_key=wallet_key,
+                keypair_path=keypair_path,
+                evm_wallet_key=evm_wallet_key,
             )
-            if str(payer.pubkey()) == metadata.fee_payer:
-                raise ProtocolError(
-                    "Buyer authority cannot also be the facilitator fee payer."
-                )
-
-            core_client = x402ClientSync()
-            register_exact_svm_client(
-                core_client,
-                KeypairSigner(payer),
-                networks=SOLANA_NETWORK,
-                rpc_url=self.rpc_url,
-            )
-            http_client = x402HTTPClientSync(core_client)
             response_headers = dict(probe.headers)
             response_headers[PAYMENT_REQUIRED_HEADER] = encoded_required
             try:
@@ -916,7 +906,8 @@ class X402ClientSDK:
                 )
             except Exception as exc:
                 raise PaymentError(
-                    f"Could not create canonical exact-SVM payment payload: {exc}"
+                    f"Could not create canonical exact-{metadata.rail.upper()} "
+                    f"payment payload: {exc}"
                 ) from exc
             if payment_payload is None:
                 raise ProtocolError("x402 client did not create a payment payload.")
@@ -926,6 +917,7 @@ class X402ClientSDK:
                 expected_endpoint=EXECUTION_GATE_ENDPOINT,
                 strict_resource=True,
                 strict_terms=True,
+                expected_payer=expected_payer,
             )
 
             # Exactly one paid POST. Ambiguous failure is recovered by GET only.
@@ -1319,6 +1311,7 @@ class X402ClientSDK:
         expected_amount: int | None = PAYMENT_AMOUNT_ATOMIC,
         max_amount: int | None = None,
         require_amount_string: bool = False,
+        prefer_base: bool = False,
     ) -> ChallengeMetadata:
         if payment_required.get("x402Version") != 2:
             raise ProtocolError("Payment challenge must use x402Version 2.")
@@ -1333,7 +1326,7 @@ class X402ClientSDK:
         accepts = payment_required.get("accepts")
         if not isinstance(accepts, list):
             raise ProtocolError("Payment challenge omitted accepts[].")
-        accepted = next(
+        svm_accepted = next(
             (
                 item
                 for item in accepts
@@ -1345,10 +1338,31 @@ class X402ClientSDK:
             ),
             None,
         )
+        base_accepted = next(
+            (
+                item
+                for item in accepts
+                if isinstance(item, dict)
+                and item.get("scheme") == "exact"
+                and item.get("network") == BASE_NETWORK
+                and item.get("asset") == BASE_USDC_ASSET
+                and item.get("payTo") == BASE_RECIPIENT_WALLET
+            ),
+            None,
+        )
+        if prefer_base and base_accepted is not None:
+            accepted = base_accepted
+            rail = "evm"
+        elif svm_accepted is not None:
+            accepted = svm_accepted
+            rail = "svm"
+        else:
+            accepted = None
+            rail = ""
         if accepted is None:
             raise ProtocolError(
-                "No option matches exact SVM, Solana mainnet, official USDC, "
-                "and the pinned recipient."
+                "No option matches a supported exact payment rail, official "
+                "USDC asset, and pinned recipient."
             )
         amount = accepted.get("amount")
         if require_amount_string and (
@@ -1383,17 +1397,31 @@ class X402ClientSDK:
                 f"USDC decimals must be {USDC_DECIMALS} when supplied."
             )
 
-        fee_payer = extra.get("feePayer")
-        memo = extra.get("memo")
         challenge_id = extra.get("challengeId") or extra.get("challenge_id")
-        if not isinstance(fee_payer, str) or not fee_payer.strip():
-            raise ProtocolError("Accepted terms omitted extra.feePayer.")
-        if not isinstance(memo, str) or not memo.strip():
-            raise ProtocolError("Accepted terms omitted extra.memo.")
-        if len(memo.encode("utf-8")) > 256:
-            raise ProtocolError("Payment memo exceeds 256 bytes.")
         if not isinstance(challenge_id, str) or not challenge_id.strip():
             raise ProtocolError("Accepted terms omitted the challenge identifier.")
+        fee_payer: str | None = None
+        memo: str | None = None
+        if rail == "evm":
+            required_eip3009 = {
+                "name": "USD Coin",
+                "version": "2",
+                "assetTransferMethod": "eip3009",
+            }
+            for field, expected in required_eip3009.items():
+                if extra.get(field) != expected:
+                    raise ProtocolError(
+                        f"Base USDC terms require extra.{field}={expected!r}."
+                    )
+        else:
+            fee_payer = extra.get("feePayer")
+            memo = extra.get("memo")
+            if not isinstance(fee_payer, str) or not fee_payer.strip():
+                raise ProtocolError("Accepted terms omitted extra.feePayer.")
+            if not isinstance(memo, str) or not memo.strip():
+                raise ProtocolError("Accepted terms omitted extra.memo.")
+            if len(memo.encode("utf-8")) > 256:
+                raise ProtocolError("Payment memo exceeds 256 bytes.")
 
         extensions = payment_required.get("extensions")
         schema_gate: dict[str, Any] | None = None
@@ -1410,7 +1438,8 @@ class X402ClientSDK:
         return ChallengeMetadata(
             resource=resource,
             accepted=accepted,
-            fee_payer=fee_payer.strip(),
+            rail=rail,
+            fee_payer=fee_payer.strip() if fee_payer is not None else None,
             memo=memo,
             challenge_id=challenge_id.strip(),
             amount_atomic=amount_atomic,
@@ -1525,6 +1554,52 @@ class X402ClientSDK:
                 "Generated payment payload exposed Schema Gate recovery metadata."
             )
 
+    def _payment_client(
+        self,
+        metadata: ChallengeMetadata,
+        *,
+        wallet_key: Any | None,
+        keypair_path: str | None,
+        evm_wallet_key: Any | None,
+    ) -> tuple[x402HTTPClientSync, str | None]:
+        core_client = x402ClientSync()
+        if metadata.rail == "evm":
+            if evm_wallet_key is None:
+                raise SDKError("A Base payment requires evm_wallet_key.")
+            try:
+                account = Account.from_key(evm_wallet_key)
+            except Exception as exc:
+                raise SDKError("evm_wallet_key is not a valid EVM private key.") from exc
+            register_exact_evm_client(
+                core_client,
+                EthAccountSigner(account),
+                networks=BASE_NETWORK,
+            )
+            return x402HTTPClientSync(core_client), account.address
+
+        if metadata.rail != "svm":
+            raise ProtocolError("Payment challenge selected an unsupported rail.")
+        if not keypair_path and wallet_key is None:
+            raise SDKError(
+                "A Solana payment requires wallet_key or a local keypair_path."
+            )
+        payer = (
+            self._coerce_keypair(wallet_key)
+            if wallet_key is not None
+            else self._load_keypair(keypair_path or "")
+        )
+        if str(payer.pubkey()) == metadata.fee_payer:
+            raise ProtocolError(
+                "Buyer authority cannot also be the facilitator fee payer."
+            )
+        register_exact_svm_client(
+            core_client,
+            KeypairSigner(payer),
+            networks=SOLANA_NETWORK,
+            rpc_url=self.rpc_url,
+        )
+        return x402HTTPClientSync(core_client), None
+
     def _validate_payment_payload(
         self,
         headers: Mapping[str, str],
@@ -1533,6 +1608,7 @@ class X402ClientSDK:
         expected_endpoint: str | None = None,
         strict_resource: bool = False,
         strict_terms: bool = False,
+        expected_payer: str | None = None,
     ) -> None:
         encoded = self._mapping_header(headers, PAYMENT_SIGNATURE_HEADER)
         if not encoded:
@@ -1571,6 +1647,46 @@ class X402ClientSDK:
             raise ProtocolError("Generated payment payload changed accepted.extra.")
 
         payload = envelope.get("payload")
+        if metadata.rail == "evm":
+            if not isinstance(payload, dict):
+                raise ProtocolError("Generated EVM payload must be an object.")
+            signature = payload.get("signature")
+            authorization = payload.get("authorization")
+            if (
+                not isinstance(signature, str)
+                or re.fullmatch(r"0x[0-9a-fA-F]{130}", signature) is None
+            ):
+                raise ProtocolError("Generated EIP-3009 signature is malformed.")
+            if not isinstance(authorization, dict):
+                raise ProtocolError("Generated EIP-3009 authorization is missing.")
+            payer = authorization.get("from")
+            if (
+                not isinstance(payer, str)
+                or re.fullmatch(r"0x[0-9a-fA-F]{40}", payer) is None
+            ):
+                raise ProtocolError("Generated EIP-3009 payer is malformed.")
+            if expected_payer is not None and payer.lower() != expected_payer.lower():
+                raise ProtocolError("Generated EIP-3009 payer changed the signer.")
+            if authorization.get("to") != metadata.accepted.get("payTo"):
+                raise ProtocolError("Generated EIP-3009 authorization changed payTo.")
+            if authorization.get("value") != metadata.accepted.get("amount"):
+                raise ProtocolError("Generated EIP-3009 authorization changed amount.")
+            for field in ("validAfter", "validBefore"):
+                value = authorization.get(field)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+                    raise ProtocolError(
+                        f"Generated EIP-3009 authorization has invalid {field}."
+                    )
+            if int(authorization["validBefore"]) <= int(authorization["validAfter"]):
+                raise ProtocolError("Generated EIP-3009 validity window is invalid.")
+            nonce = authorization.get("nonce")
+            if (
+                not isinstance(nonce, str)
+                or re.fullmatch(r"0x[0-9a-fA-F]{64}", nonce) is None
+            ):
+                raise ProtocolError("Generated EIP-3009 nonce is malformed.")
+            return
+
         transaction = payload.get("transaction") if isinstance(payload, dict) else None
         if not isinstance(transaction, str) or not transaction:
             raise ProtocolError(

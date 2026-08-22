@@ -698,3 +698,193 @@ class ExecutionGateSDKTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+def _base_first_payment_required() -> dict:
+    endpoint = "https://www.x402digitalvendingmachine.store/v1/schema-gate"
+    challenge_id = "challenge-base-first"
+    return {
+        "x402Version": 2,
+        "error": "Payment required",
+        "resource": {
+            "url": endpoint,
+            "description": "Schema Gate",
+            "mimeType": "application/json",
+        },
+        "accepts": [
+            {
+                "scheme": "exact",
+                "network": "eip155:8453",
+                "amount": "10000",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0xCbE8df651925485046bFd42b736186433904F8a6",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "name": "USD Coin",
+                    "version": "2",
+                    "assetTransferMethod": "eip3009",
+                    "challengeId": challenge_id,
+                },
+            },
+            {
+                "scheme": "exact",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "10000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "decimals": 6,
+                    "feePayer": "E2PxHWFSwzt6a3osZRQeT16tsb7BPLfXEMuDfjnZuhFD",
+                    "memo": f"x402:{challenge_id}",
+                    "challengeId": challenge_id,
+                },
+            },
+        ],
+    }
+
+
+def test_evm_wallet_key_is_appended_to_public_methods():
+    import inspect
+
+    from scripts.x402_client_sdk import X402ClientSDK
+
+    for method in (
+        X402ClientSDK.clean_text,
+        X402ClientSDK.schema_gate,
+        X402ClientSDK.execution_gate,
+    ):
+        assert list(inspect.signature(method).parameters)[-1] == "evm_wallet_key"
+
+
+def test_base_first_dual_accept_preserves_solana_for_existing_callers():
+    from scripts.x402_client_sdk import X402ClientSDK
+
+    challenge = _base_first_payment_required()
+    metadata = X402ClientSDK()._validate_payment_required(
+        challenge,
+        expected_endpoint=challenge["resource"]["url"],
+        expected_amount=10_000,
+    )
+
+    assert metadata.rail == "svm"
+    assert metadata.accepted["network"].startswith("solana:")
+
+
+def test_evm_wallet_prefers_base_and_validates_eip3009_payload():
+    import base64
+    import json
+
+    from scripts.x402_client_sdk import X402ClientSDK
+
+    challenge = _base_first_payment_required()
+    endpoint = challenge["resource"]["url"]
+    payer = "0x1111111111111111111111111111111111111111"
+    sdk = X402ClientSDK()
+    metadata = sdk._validate_payment_required(
+        challenge,
+        expected_endpoint=endpoint,
+        expected_amount=10_000,
+        prefer_base=True,
+    )
+    envelope = {
+        "x402Version": 2,
+        "resource": challenge["resource"],
+        "accepted": metadata.accepted,
+        "payload": {
+            "signature": "0x" + ("ab" * 65),
+            "authorization": {
+                "from": payer,
+                "to": metadata.accepted["payTo"],
+                "value": metadata.accepted["amount"],
+                "validAfter": "0",
+                "validBefore": "9999999999",
+                "nonce": "0x" + ("cd" * 32),
+            },
+        },
+    }
+    payment_header = base64.b64encode(
+        json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    assert metadata.rail == "evm"
+    assert metadata.accepted["network"] == "eip155:8453"
+    sdk._validate_payment_payload(
+        {"PAYMENT-SIGNATURE": payment_header},
+        metadata,
+        expected_endpoint=endpoint,
+        expected_payer=payer,
+    )
+
+
+def test_official_x402_client_signs_selected_base_eip3009_offer():
+    import base64
+    import json
+
+    from scripts.x402_client_sdk import X402ClientSDK
+
+    challenge = _base_first_payment_required()
+    endpoint = challenge["resource"]["url"]
+    sdk = X402ClientSDK()
+    metadata = sdk._validate_payment_required(
+        challenge,
+        expected_endpoint=endpoint,
+        expected_amount=10_000,
+        prefer_base=True,
+    )
+    http_client, payer = sdk._payment_client(
+        metadata,
+        wallet_key=None,
+        keypair_path=None,
+        evm_wallet_key="0x" + ("01" * 32),
+    )
+    encoded_required = base64.b64encode(
+        json.dumps(challenge, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    payment_headers, payment_payload = http_client.handle_402_response(
+        {"PAYMENT-REQUIRED": encoded_required},
+        b"",
+        endpoint,
+    )
+
+    assert payment_payload is not None
+    sdk._validate_payment_payload(
+        payment_headers,
+        metadata,
+        expected_endpoint=endpoint,
+        expected_payer=payer,
+    )
+
+
+def test_base_accept_rejects_noncanonical_eip3009_terms():
+    import copy
+
+    import pytest
+
+    from scripts.x402_client_sdk import ProtocolError, X402ClientSDK
+
+    challenge = _base_first_payment_required()
+    challenge["accepts"] = [challenge["accepts"][0]]
+    endpoint = challenge["resource"]["url"]
+    mutations = (
+        ("network", "eip155:1"),
+        ("asset", "0x1111111111111111111111111111111111111111"),
+        ("payTo", "0x2222222222222222222222222222222222222222"),
+        ("name", "Not USD Coin"),
+        ("version", "1"),
+        ("assetTransferMethod", "permit2"),
+    )
+
+    for field, value in mutations:
+        malformed = copy.deepcopy(challenge)
+        target = malformed["accepts"][0]
+        if field in {"name", "version", "assetTransferMethod"}:
+            target["extra"][field] = value
+        else:
+            target[field] = value
+        with pytest.raises(ProtocolError):
+            X402ClientSDK()._validate_payment_required(
+                malformed,
+                expected_endpoint=endpoint,
+                expected_amount=10_000,
+                prefer_base=True,
+            )
